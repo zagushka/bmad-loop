@@ -52,6 +52,12 @@ _HOOK_DISCOVERY_SAFE_PAIRS: dict[str, frozenset[str]] = {
 # profile (the shipped codex sandboxed mapping); any other key may move config
 # or hook discovery.
 _CONFIG_FLAG = "-c"
+_SAFE_CONFIG_OVERRIDES = frozenset(
+    {
+        'model_reasoning_effort="high"',
+        'agents.default_subagent_reasoning_effort="high"',
+    }
+)
 _SAFE_CONFIG_KEY_RE = re.compile(r"(?:default_permissions|permissions\.[A-Za-z0-9_.-]+)\s*=")
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 # The ``unverifiable`` reason when the ``hooks/list`` query itself failed (spawn
@@ -96,7 +102,9 @@ def hook_discovery_args_safe(args: tuple[str, ...] | None) -> bool:
         if arg in _HOOK_DISCOVERY_SAFE_PAIRS:
             if value not in _HOOK_DISCOVERY_SAFE_PAIRS[arg]:
                 return False
-        elif arg != _CONFIG_FLAG or not _SAFE_CONFIG_KEY_RE.match(value):
+        elif arg != _CONFIG_FLAG or (
+            value not in _SAFE_CONFIG_OVERRIDES and not _SAFE_CONFIG_KEY_RE.match(value)
+        ):
             return False
         i += 2
     return True

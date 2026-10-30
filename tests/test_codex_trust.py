@@ -599,6 +599,14 @@ def test_hook_discovery_args_safe_shipped_sandboxed_mapping_is_safe():
         ("--sandbox", "workspace-write", "--ask-for-approval", "never", "--no-daemon"),
         ("-c", 'default_permissions="bmad_loop"'),
         ("-c", 'permissions.bmad_loop.extends=":workspace"'),
+        ("-c", 'model_reasoning_effort="high"'),
+        ("-c", 'agents.default_subagent_reasoning_effort="high"'),
+        (
+            "-c",
+            'model_reasoning_effort="high"',
+            "-c",
+            'agents.default_subagent_reasoning_effort="high"',
+        ),
     ],
 )
 def test_hook_discovery_args_safe_accepts_safe_pairs(args):
@@ -619,6 +627,12 @@ def test_hook_discovery_args_safe_accepts_safe_pairs(args):
         # a config override outside the permission-profile keys
         ("-c", "hooks.x=1"),
         ("-c", "default_permissions_extra=1"),
+        # reasoning overrides are safe only as the exact approved literals
+        ("-c", 'model_reasoning_effort="medium"'),
+        ("-c", 'model_reasoning_effort ="high"'),
+        ("-c", 'model_reasoning_effort="high";hooks.x=1'),
+        ("-c", 'agents.default_subagent_reasoning_effort="high" '),
+        ("-c", 'agents.default_subagent_reasoning_effort="high";hooks.x=1'),
         # an unknown flag consuming a safe token as its value
         ("--profile", "never"),
     ],

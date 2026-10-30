@@ -1863,7 +1863,8 @@ def test_resume_arm_into_an_untrusted_codex_review_session_escalates_without_lau
     assert wt.is_dir()  # kept for the operator to trust, re-arm, and resume
 
 
-def test_codex_gate_reads_the_provisioned_worktree_hook_config(project, monkeypatch):
+@pytest.mark.parametrize("trust_status", ["trusted", "untrusted"])
+def test_codex_gate_reads_the_provisioned_worktree_hook_config(project, monkeypatch, trust_status):
     """Gate-after-provisioning, with the REAL trust oracle: only the Codex app-server
     query (``_hooks_list``) and the binary lookup are stubbed, so
     ``project_hook_trust`` reads the worktree's own ``.codex/hooks.json`` and joins
@@ -1887,7 +1888,7 @@ def test_codex_gate_reads_the_provisioned_worktree_hook_config(project, monkeypa
                 "eventName": trust_mod._EVENTS[canonical],
                 "handlerType": "command",
                 "command": hook["command"],
-                "trustStatus": "trusted",
+                "trustStatus": trust_status,
                 "enabled": True,
             }
             for canonical, groups in config["hooks"].items()
@@ -1906,12 +1907,27 @@ def test_codex_gate_reads_the_provisioned_worktree_hook_config(project, monkeypa
         [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
     )
     monkeypatch.setattr(adapter, "profile", codex, raising=False)
+    monkeypatch.setattr(
+        adapter,
+        "extra_args",
+        (
+            "-c",
+            'model_reasoning_effort="high"',
+            "-c",
+            'agents.default_subagent_reasoning_effort="high"',
+        ),
+        raising=False,
+    )
 
     summary = engine.run()
 
-    assert summary.done == 1 and not summary.paused, engine.state.paused_reason
     wt = Path(engine.state.tasks["1-1-a"].worktree_path or "")
     assert listed and all(cwd == wt for cwd in listed)
+    if trust_status == "trusted":
+        assert summary.done == 1 and not summary.paused, engine.state.paused_reason
+    else:
+        assert summary.paused and engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+        assert adapter.sessions == []
 
 
 def test_main_checkout_codex_session_in_an_isolated_run_never_queries_trust(project, monkeypatch):
