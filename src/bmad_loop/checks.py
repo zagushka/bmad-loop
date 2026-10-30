@@ -121,6 +121,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         # project plugins with an executable surface need an operator content grant (#496/#497)
         "plugins.trust",
         "skills.base",
+        "skills.dependencies",
+        "skills.legacy-runtime",
         "skills.base-missing",
         "skills.base-incomplete",
         "skills.base-shim",

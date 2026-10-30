@@ -328,6 +328,7 @@ class StoriesPolicy:
 
     source: str = "sprint-status"
     spec_folder: str = ""
+    legacy_runtime: str = ""
 
 
 @dataclass(frozen=True)
@@ -1222,6 +1223,9 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
             f" got {review.on_status_contradiction!r}"
         )
     stories = StoriesPolicy(
+        legacy_runtime=_typed_str(
+            stories_d, "stories", "legacy_runtime", StoriesPolicy.legacy_runtime
+        ).strip(),
         source=_typed_str(stories_d, "stories", "source", StoriesPolicy.source).strip(),
         spec_folder=_typed_str(
             stories_d, "stories", "spec_folder", StoriesPolicy.spec_folder
@@ -1641,6 +1645,7 @@ on_status_contradiction = "escalate"
 # (experimental; see docs/tickets-guide.md). `bmad-loop run --spec <folder>`
 # forces stories mode for a single run regardless of this setting.
 source = "sprint-status"     # sprint-status | stories | tickets
+legacy_runtime = ""        # verified legacy runtime bundle for sprint/stories; ignored for tickets
 # Required (and must parse) when source = "stories": the project-relative path to
 # the epic's spec folder holding stories.yaml + SPEC.md. Ignored by the other sources.
 spec_folder = ""

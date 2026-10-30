@@ -789,8 +789,7 @@ def _probe_unreadable(check: str, rel: str, fault: str) -> Finding:
     return Finding(
         check,
         "problem",
-        f"{rel} could not be checked ({fault}) — fix its permissions or the filesystem "
-        "and re-run",
+        f"{rel} could not be checked ({fault}) — fix its permissions or the filesystem and re-run",
         {"path": rel, "error": fault},
     )
 
@@ -820,9 +819,7 @@ def _initiative_children(folder: Path) -> tuple[tuple[str, ...] | None, Path, st
         return None, path, "`initiative` is not a list of `[[initiative]]` tables"
     children: list[str] = []
     for row in rows:  # pyright: ignore[reportUnknownVariableType]
-        slug = (
-            row.get("slug") if isinstance(row, dict) else None
-        )  # pyright: ignore[reportUnknownMemberType]
+        slug = row.get("slug") if isinstance(row, dict) else None  # pyright: ignore[reportUnknownMemberType]
         if not isinstance(slug, str):
             return None, path, "an `[[initiative]]` table has no text `slug`"
         children.append(slug)
@@ -872,7 +869,7 @@ def _tickets_store_findings(
             )
         if sandboxed_roles:
             causes.append(
-                f"{', '.join(sandboxed_roles)} run permission_mode = \"sandboxed\", whose "
+                f'{", ".join(sandboxed_roles)} run permission_mode = "sandboxed", whose '
                 'sandbox confines writes to the working directory (use "bypass" there)'
             )
         findings.append(
@@ -1372,6 +1369,10 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                     )
                 )
         problems.extend(_review_findings(project, tree))
+        try:
+            skill_dependency_closure(project, tree, [dev_primitive_or_default(project, tree)])
+        except ValueError as exc:
+            problems.append(Finding("skills.dependencies", "problem", str(exc), {"tree": tree}))
     if resolved_stub and not (project / CENTRAL_CONFIG_REL).is_file():
         problems.append(
             Finding(
@@ -1431,8 +1432,10 @@ def dev_renderer_probe(project: Path, trees: Sequence[str]) -> list[Finding]:
       temp dir as cwd. Render failures are path-independent, so the copy answers
       the session's question while ``validate`` stays a non-writer: the project,
       including ``_bmad/render/``, is never touched, and the temp dir is removed.
-    - rc 0 plus a stdout line starting ``read and follow `` is ``ok``; a stdout
-      ``HALT: `` line is a problem carrying the halt text (``detail["halt"]``);
+    - rc 0 plus a stdout line starting ``read and follow `` is ``ok``. v7's
+      inline workflow is also ``ok`` when stdout exactly matches a newly generated,
+      confined workflow snapshot, including quoted HALT examples. Otherwise a
+      stdout ``HALT: `` line is a problem carrying the halt text (``detail["halt"]``);
       anything else (e.g. a bare traceback) is a problem naming the rc and the last
       stderr/stdout line. A launcher (argv[0]) absent from PATH, a spawn
       ``OSError``, a timeout (:data:`RENDER_PROBE_TIMEOUT_S`) and a staging
@@ -1525,6 +1528,62 @@ def _stage_render_copy(project: Path, skill_dir: Path, root: Path, tmp_skill: Pa
     tmp_skill.parent.mkdir(parents=True, exist_ok=True)
     # dirs_exist_ok: a skill tree under `_bmad/` was already copied with it.
     shutil.copytree(skill_dir, tmp_skill, symlinks=True, dirs_exist_ok=True)
+    tree = skill_dir.parent.relative_to(project).as_posix()
+    for dependency in skill_dependency_closure(project, tree, [skill_dir.name]):
+        if dependency != skill_dir.name:
+            shutil.copytree(
+                project / tree / dependency,
+                tmp_skill.parent / dependency,
+                symlinks=True,
+                dirs_exist_ok=True,
+            )
+
+
+def skill_dependency_closure(project: Path, tree: str, skills: Sequence[str]) -> tuple[str, ...]:
+    """Resolve installed skill/module declarations, including the hub, without executing them."""
+    pending = list(skills)
+    selected: list[str] = []
+    module_records: set[str] = set()
+    while pending:
+        name = pending.pop(0)
+        if name in selected:
+            continue
+        if not name or Path(name).name != name or name in {".", ".."}:
+            raise ValueError(f"invalid declared skill dependency: {name!r}")
+        selected.append(name)
+        manifest = project / tree / name / "bmod.toml"
+        if not manifest.exists():
+            continue
+        data = _read_toml(manifest)
+        if data is None:
+            raise ValueError(f"cannot read skill dependency manifest: {manifest}")
+        for section in ("skill", "bmod"):
+            record = data.get(section, {})
+            if not isinstance(record, dict):
+                raise ValueError(f"invalid [{section}] in {manifest}")
+            module = record.get("bmod")
+            if module is not None:
+                if not isinstance(module, str):
+                    raise ValueError(f"invalid module dependency in {manifest}")
+                pending.append(module)
+                module_records.add(module)
+            requirements = record.get("required_skills", [])
+            if not isinstance(requirements, list):
+                raise ValueError(f"invalid required_skills in {manifest}")
+            for requirement in requirements:
+                dependency = (
+                    requirement.get("skill") if isinstance(requirement, dict) else requirement
+                )
+                if not isinstance(dependency, str):
+                    raise ValueError(f"invalid required skill in {manifest}")
+                pending.append(dependency)
+    for name in module_records:
+        if not (project / tree / name / "bmod.toml").is_file():
+            raise ValueError(f"missing declared module record: {tree}/{name}/bmod.toml")
+    for name in selected:
+        if name not in skills and not (project / tree / name / "SKILL.md").is_file():
+            raise ValueError(f"missing declared skill dependency: {tree}/{name}")
+    return tuple(selected)
 
 
 def _last_line(text: str) -> str:
@@ -1549,8 +1608,7 @@ def _probe_render(project: Path, tree: str, skill: str) -> Finding:
     line = _render_command_line(skill_md)
     if line is None:
         return problem(
-            f"{unparsed} (no fenced code line names {RENDERER_SCRIPT_MARKER}); "
-            "nothing was executed"
+            f"{unparsed} (no fenced code line names {RENDERER_SCRIPT_MARKER}); nothing was executed"
         )
     detail["command"] = line
     try:
@@ -1593,7 +1651,7 @@ def _render_in(
     tmp_skill = root / tree / skill
     try:
         _stage_render_copy(project, project / tree / skill, root, tmp_skill)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return problem(f"{rel}: could not stage the throwaway render copy ({unmap(str(exc))})")
     argv = [
         arg.replace(RENDER_PROJECT_ROOT_PLACEHOLDER, str(root)).replace(
@@ -1645,6 +1703,36 @@ def _render_in(
         with contextlib.suppress(ProcessHostError, OSError):
             childrun.kill_tree(proc)
         return problem(f"{rel}: render command output could not be read ({unmap(str(exc))})")
+    # v7 prints the workflow body. Only a fresh, confined snapshot can prove it.
+    inline_snapshot = False
+    render_dir = root / RENDER_DIR_REL
+    if proc.returncode == 0 and raw_out and render_dir.is_dir() and not render_dir.is_symlink():
+        try:
+            if render_dir.resolve().is_relative_to(root.resolve()):
+                for snapshot in render_dir.rglob(RENDERER_ENTRY_REL):
+                    if any(
+                        path.is_symlink()
+                        for path in (snapshot, *snapshot.parents)
+                        if path.is_relative_to(render_dir)
+                    ):
+                        continue
+                    if not snapshot.resolve().is_relative_to(render_dir.resolve()):
+                        continue
+                    try:
+                        if snapshot.read_text(encoding="utf-8") == raw_out:
+                            inline_snapshot = True
+                            break
+                    except (OSError, UnicodeDecodeError):
+                        continue
+        except (OSError, RuntimeError):
+            pass  # The ordinary failed-render finding below names the command output.
+    if inline_snapshot:
+        return Finding(
+            RENDER_PROBE_CHECK,
+            "ok",
+            f"{rel} renders cleanly (fresh workflow snapshot matches stdout; project untouched)",
+            {**detail, "rc": proc.returncode},
+        )
     stdout = unmap(raw_out or "")
     stderr = unmap(raw_err or "")
     out_lines = stdout.splitlines()
@@ -1652,8 +1740,7 @@ def _render_in(
     if halt is not None:
         text = halt[len(_RENDER_HALT_PREFIX) :].strip()
         return problem(
-            f"{rel}: render HALTs: {text} — a dev session would stop here without "
-            "writing a spec",
+            f"{rel}: render HALTs: {text} — a dev session would stop here without writing a spec",
             rc=proc.returncode,
             halt=text,
         )

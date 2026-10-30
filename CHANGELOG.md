@@ -203,6 +203,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Accept fresh v7 workflow-body renders, carry declared module and hub dependencies,
+  and select a verified legacy runtime for retained sprint/stories queues without
+  reseeding retained workers.
+
 - Show the legacy `[engine]` deprecation notice to CLI users: it was a `DeprecationWarning`,
   which Python hides outside `__main__`. It is now `policy.PolicyDeprecationWarning` (a
   `FutureWarning`), printed once on stderr as `bmad-loop: warning: …`, and `validate` reports

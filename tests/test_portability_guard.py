@@ -1151,7 +1151,7 @@ JOURNAL_SPLAT_ALLOW = {
     # why one field inventory covers the pair; the count is the only thing that can
     # see a third arrive, whether as a third write or as a second `**` on one of
     # these two.
-    ("engine.py", "_run_session"): 2,
+    ("engine.py", "_run_session_impl"): 2,
     # One unresolved `**fields` forward: the forwarder's own hole.
     ("plugins/bus.py", "_log"): 1,
 }
@@ -1226,7 +1226,7 @@ JOURNAL_SPLAT_FIELDS = {
     # that these keys "are in the benign inventory because other sites journal them
     # explicitly" was simply false. They are in it because THIS declaration puts them
     # there. ⚠️ A new key added inside `_session_end_extras` is still invisible.
-    ("engine.py", "_run_session"): frozenset(
+    ("engine.py", "_run_session_impl"): frozenset(
         {
             "fired_at",
             "teardown_s",
@@ -4788,10 +4788,9 @@ def test_ledger_read_allowlist_has_no_stale_rows():
     dropping its row, and this reddens naming the row."""
     seen = {(rel, fn) for _, rel, _, _, fn, _ in _of("ledgerread")}
     stale = LEDGER_READ_INLINE - seen
-    assert (
-        not stale
-    ), "LEDGER_READ_INLINE rows that no longer name a ledger read — drop them:\n" + "\n".join(
-        f"  {rel}: {fn}" for rel, fn in sorted(stale)
+    assert not stale, (
+        "LEDGER_READ_INLINE rows that no longer name a ledger read — drop them:\n"
+        + "\n".join(f"  {rel}: {fn}" for rel, fn in sorted(stale))
     )
 
 
@@ -4896,9 +4895,9 @@ def test_ledger_read_detector_scoping(label, rel, source, is_offender):
     offenders = _ledger_read_offenders(
         [f for f in _scan_source(source, rel) if f[0] == "ledgerread"]
     )
-    assert (
-        bool(offenders) is is_offender
-    ), f"{label!r} was {'not ' if is_offender else ''}flagged unexpectedly:\n{source}"
+    assert bool(offenders) is is_offender, (
+        f"{label!r} was {'not ' if is_offender else ''}flagged unexpectedly:\n{source}"
+    )
 
 
 def test_proof_quiet_diff_is_owned_by_the_central_tri_state_probe():
@@ -4931,7 +4930,9 @@ def test_proof_quiet_diff_is_owned_by_the_central_tri_state_probe():
             callee = (
                 node.func.id
                 if isinstance(node.func, ast.Name)
-                else node.func.attr if isinstance(node.func, ast.Attribute) else None
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else None
             )
             if callee == "_changes_since":
                 tri_state_callers[(self.rel, owner)] += 1
@@ -6321,9 +6322,9 @@ def test_journal_kind_inventory_message_gives_each_arm_its_own_remedy():
 
     # All three at once still reads as three remedies, not one blurred paragraph.
     everything = _journal_kind_inventory_message([site, real], {"epic-boundary"})
-    assert all(
-        clue in everything for clue in ("CALL SITE", "IN THE SAME PR", "  stale row: ")
-    ), everything
+    assert all(clue in everything for clue in ("CALL SITE", "IN THE SAME PR", "  stale row: ")), (
+        everything
+    )
 
 
 def test_journal_field_guard_actually_saw_the_producers():
@@ -6589,9 +6590,9 @@ def test_journal_append_writes_only_accounted_fields(tmp_path):
     lines = (run_dir / JOURNAL_FILE).read_text(encoding="utf-8").splitlines()
     entry = json.loads(lines[-1])
     minted = set(entry) - {"ts", "kind"}
-    assert (
-        "log_pos" in minted and "log_task" in minted
-    ), f"Journal.append stopped stamping the pane-log pointer: {sorted(minted)}"
+    assert "log_pos" in minted and "log_task" in minted, (
+        f"Journal.append stopped stamping the pane-log pointer: {sorted(minted)}"
+    )
     unaccounted = minted - JOURNAL_ROUTED_FIELDS - JOURNAL_BENIGN_FIELDS
     assert unaccounted == set(), (
         "Journal.append writes a field name neither routed by diagnostics nor "
@@ -6648,10 +6649,9 @@ def test_os_kill_only_in_process_host():
     review tripwire, not a sandbox. Other call sites route through the ProcessHost
     seam (``terminate`` / ``force_kill`` / ``is_alive``)."""
     offenders = [(rel, ln, txt) for _, rel, ln, txt in _of("oskill") if rel not in OS_KILL_ALLOW]
-    assert (
-        not offenders
-    ), "os.kill( outside process_host.py — route it through the ProcessHost seam:\n" + "\n".join(
-        f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders
+    assert not offenders, (
+        "os.kill( outside process_host.py — route it through the ProcessHost seam:\n"
+        + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
 
 
@@ -7972,8 +7972,7 @@ TASK_ARTIFACT_SCOPE_CASES = [
         (
             f"journal-bare-literal-beside-it:{name}",
             "journal.py",
-            f"TASK_CYCLE_ARTIFACTS: tuple[str, ...] = ({_ARTIFACT_TUPLE_SRC})\n"
-            f'STALE = "{name}"\n',
+            f'TASK_CYCLE_ARTIFACTS: tuple[str, ...] = ({_ARTIFACT_TUPLE_SRC})\nSTALE = "{name}"\n',
             True,
         )
         for name in TASK_CYCLE_ARTIFACTS
@@ -8792,8 +8791,7 @@ def test_journal_kind_declaration_is_scoped_by_position(label, rel, fn, is_offen
     elsewhere is allowed to be unreadable."""
     offenders = _journal_kind_offenders([("journalkind", rel, 1, "journal.append(kind)", fn)])
     assert bool(offenders) is is_offender, (
-        f"a non-literal kind in {rel}::{fn} should "
-        f"{'be refused' if is_offender else 'be allowed'}"
+        f"a non-literal kind in {rel}::{fn} should {'be refused' if is_offender else 'be allowed'}"
     )
 
 
@@ -9053,9 +9051,9 @@ def test_journal_field_offenders_flag_every_line_of_an_over_declared_splat():
     ), offenders
     # …and the declared population itself stays silent, so the row above is not
     # passing because the branch refuses every splat.
-    assert (
-        _journal_field_offenders(findings[:_SPLAT_DECLARED]) == []
-    ), "the declared count is refused, so the over-count assertion proves nothing"
+    assert _journal_field_offenders(findings[:_SPLAT_DECLARED]) == [], (
+        "the declared count is refused, so the over-count assertion proves nothing"
+    )
 
 
 # ONE call carrying TWO unresolvable `**` arguments, at a position declaring one. The
@@ -9123,9 +9121,9 @@ def test_journal_measured_splats_counts_arguments_not_calls():
         (None, fn, "session-end")
     ] * _SPLAT_ONE_CALL_MEASURED, findings
     assert len({ln for _, _, ln, _, _ in findings}) == 1, findings
-    assert _journal_measured_splats(findings) == Counter(
-        {(rel, fn): _SPLAT_ONE_CALL_MEASURED}
-    ), findings
+    assert _journal_measured_splats(findings) == Counter({(rel, fn): _SPLAT_ONE_CALL_MEASURED}), (
+        findings
+    )
 
     # …and the consequence: measured 2 against the position's declared 1 is an
     # over-count, so the routing guard flags the call rather than waiving it. The

@@ -30,6 +30,7 @@ from . import (
     frontmatter,
     gates,
     install,
+    legacy_runtime,
     machine,
     operatoractions,
 )
@@ -836,6 +837,18 @@ def cmd_validate(args: argparse.Namespace) -> int:
         else:
             warnings.showwarning(w.message, w.category, w.filename, w.lineno, w.file, w.line)
     source, spec_folder = _resolve_source(args, loaded_pol)
+    runtime = None
+    runtime_invalid = False
+    if loaded_pol is not None:
+        try:
+            runtime = legacy_runtime.selected(project, loaded_pol, source)
+            if runtime is not None and loaded_pol.scm.isolation != "worktree":
+                raise legacy_runtime.RuntimeError(
+                    "legacy runtime requires scm.isolation = worktree"
+                )
+        except legacy_runtime.RuntimeError as exc:
+            report.fail("skills.legacy-runtime", str(exc))
+            runtime_invalid = True
 
     try:
         paths = bmadconfig.load_paths(project, want_tickets=source == worksource.SOURCE_TICKETS)
@@ -930,16 +943,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
         else []
     )
 
-    if paths:
-        _QUEUE_VALIDATORS[source](
-            project,
-            paths,
-            spec_folder,
-            dev_trees,
-            report,
-            bool(getattr(args, "probes", False)),
-            pol,
-        )
+    if paths and not runtime_invalid:
+        with legacy_runtime.surface(project, runtime) as skill_project:
+            _QUEUE_VALIDATORS[source](
+                skill_project if source == worksource.SOURCE_STORIES else project,
+                paths,
+                spec_folder,
+                dev_trees,
+                report,
+                bool(getattr(args, "probes", False)),
+                pol,
+            )
 
     # `git_answers` carries ONE fact from this probe to the two below it: not
     # whether the tree was clean, but whether the binary answered at all. A
@@ -1496,40 +1510,42 @@ def cmd_validate(args: argparse.Namespace) -> int:
             if prof is not None:
                 _report_permission_mode(report, role, cfg, prof, pol.scm.isolation)
 
-    base_findings = install.missing_base_skills(project, dev_trees)
-    # gated on PROBLEMS, not on any finding: an advisory review layer (a `when`
-    # gate, a phrasing this check can't confirm, a broken override) is a warning
-    # that must ride alongside the ok line rather than suppress it.
-    #
-    # Gate on `dev_trees`, not `profiles`: policy never validates an adapter name
-    # (the first test is `get_profile`), so `[adapter] name = "nosuchcli"` beside a
-    # loadable `[adapter.triage]` leaves `profiles` non-empty while nothing dev-side
-    # resolved — and the ok line would then be a green sentence assembled from an
-    # empty probe. Can only tighten: `dev_trees` truthy implies `profiles` truthy.
-    if dev_trees and not any(f.severity == "problem" for f in base_findings):
-        # Name the primitive that actually resolved, not a hardcoded era: on an
-        # upgraded project this is the operator's confirmation that the rename was
-        # picked up (and, across trees, that both picked up the same one).
-        resolved = list(
-            dict.fromkeys(
-                name
-                for tree in dict.fromkeys(dev_trees)
-                if (name := install.resolve_dev_primitive(project, tree)) is not None
-            )
-        )
-        report.ok(
-            "skills.base",
-            f"upstream skills present ({' + '.join(resolved)} + review layers)",
-            {"trees": list(dict.fromkeys(dev_trees)), "dev_primitive": resolved},
-        )
-    report.extend(base_findings)
-    report.extend(install.dev_primitive_warnings(project, dev_trees))
-    # Opt-in only: the probe executes project-controlled content (the stub's argv and
-    # render_skill.py), and plain validate must stay non-executing for a fresh clone.
-    # Gated on `dev_trees` too, as `skills.base` is: an unloadable policy leaves it
-    # empty, and "nothing to render" would be a green line from an empty probe.
-    if dev_trees and getattr(args, "render_probe", False):
-        report.extend(install.dev_renderer_probe(project, dev_trees))
+    if not runtime_invalid:
+        with legacy_runtime.surface(project, runtime) as skill_project:
+            base_findings = install.missing_base_skills(skill_project, dev_trees)
+            # gated on PROBLEMS, not on any finding: an advisory review layer (a `when`
+            # gate, a phrasing this check can't confirm, a broken override) is a warning
+            # that must ride alongside the ok line rather than suppress it.
+            #
+            # Gate on `dev_trees`, not `profiles`: policy never validates an adapter name
+            # (the first test is `get_profile`), so `[adapter] name = "nosuchcli"` beside a
+            # loadable `[adapter.triage]` leaves `profiles` non-empty while nothing dev-side
+            # resolved — and the ok line would then be a green sentence assembled from an
+            # empty probe. Can only tighten: `dev_trees` truthy implies `profiles` truthy.
+            if dev_trees and not any(f.severity == "problem" for f in base_findings):
+                # Name the primitive that actually resolved, not a hardcoded era: on an
+                # upgraded project this is the operator's confirmation that the rename was
+                # picked up (and, across trees, that both picked up the same one).
+                resolved = list(
+                    dict.fromkeys(
+                        name
+                        for tree in dict.fromkeys(dev_trees)
+                        if (name := install.resolve_dev_primitive(skill_project, tree)) is not None
+                    )
+                )
+                report.ok(
+                    "skills.base",
+                    f"upstream skills present ({' + '.join(resolved)} + review layers)",
+                    {"trees": list(dict.fromkeys(dev_trees)), "dev_primitive": resolved},
+                )
+            report.extend(base_findings)
+            report.extend(install.dev_primitive_warnings(skill_project, dev_trees))
+            # Opt-in only: the probe executes project-controlled content (the stub's argv and
+            # render_skill.py), and plain validate must stay non-executing for a fresh clone.
+            # Gated on `dev_trees` too, as `skills.base` is: an unloadable policy leaves it
+            # empty, and "nothing to render" would be a green line from an empty probe.
+            if dev_trees and getattr(args, "render_probe", False):
+                report.extend(install.dev_renderer_probe(skill_project, dev_trees))
 
     # The triage tree's `bmad-loop-sweep`, probed exactly as `_require_sweep_skill`
     # probes it so validate and the sweep refusal agree. Only when a triage tree
@@ -2486,23 +2502,36 @@ def _warn_preflight_would_abort(
     from .plugins import store
 
     trees = _skill_trees(paths.project, pol, paths.repo_root, store.load_grants(paths.project))
-    problems = [
-        p.message
-        for p in install.missing_base_skills(paths.project, trees)
-        + (install.missing_stories_support(paths.project, trees) if require_stories else [])
-        + (install.missing_tickets_support(paths.project, trees) if require_tickets else [])
-        + (
-            install.missing_sweep_skill(paths.project, _triage_trees(paths.project, pol))
-            if require_sweep
-            else []
+    try:
+        runtime = legacy_runtime.selected(
+            paths.project,
+            pol,
+            "tickets" if require_tickets else "stories" if require_stories else pol.stories.source,
         )
-        if p.severity == "problem"
-    ]
+        if runtime is not None and pol.scm.isolation != "worktree":
+            raise legacy_runtime.RuntimeError("legacy runtime requires scm.isolation = worktree")
+        with legacy_runtime.surface(paths.project, runtime) as skill_project:
+            problems = [
+                p.message
+                for p in install.missing_base_skills(skill_project, trees)
+                + (install.missing_stories_support(skill_project, trees) if require_stories else [])
+                + (install.missing_tickets_support(skill_project, trees) if require_tickets else [])
+                + (
+                    install.missing_sweep_skill(paths.project, _triage_trees(paths.project, pol))
+                    if require_sweep
+                    else []
+                )
+                if p.severity == "problem"
+            ]
+    except legacy_runtime.RuntimeError as exc:
+        problems = [str(exc)]
     # the store the launch judges: a tickets run's, or the one a sweep works
     store_source = (
         worksource.SOURCE_TICKETS
         if require_tickets
-        else _sweep_store_source(paths, pol) if require_sweep else None
+        else _sweep_store_source(paths, pol)
+        if require_sweep
+        else None
     )
     if store_source is not None and (
         store := ticketstore.store_conflict(paths.project, store_source, pol.scm.isolation)
@@ -2596,6 +2625,7 @@ def _require_base_skills(
     require_stories: bool = False,
     require_tickets: bool = False,
     review_owed: bool = False,
+    source: str | None = None,
 ) -> bool:
     """Preflight the upstream skills the orchestrator drives (the dev primitive —
     bmad-build-auto, or a complete pre-rename bmad-dev-auto — plus the review layers
@@ -2615,11 +2645,30 @@ def _require_base_skills(
     route tickets mode dispatches through. ``review_owed`` keeps the review tree
     gated (`_skill_trees`)."""
     skill_trees = _skill_trees(project, pol, root, grants, review_owed=review_owed)
-    findings = install.missing_base_skills(project, skill_trees)
-    if require_stories:
-        findings += install.missing_stories_support(project, skill_trees)
-    if require_tickets:
-        findings += install.missing_tickets_support(project, skill_trees)
+    try:
+        runtime = legacy_runtime.selected(
+            project,
+            pol,
+            source
+            or (
+                "tickets"
+                if require_tickets
+                else "stories"
+                if require_stories
+                else pol.stories.source
+            ),
+        )
+        if runtime is not None and pol.scm.isolation != "worktree":
+            raise legacy_runtime.RuntimeError("legacy runtime requires scm.isolation = worktree")
+        with legacy_runtime.surface(project, runtime) as skill_project:
+            findings = install.missing_base_skills(skill_project, skill_trees)
+            if require_stories:
+                findings += install.missing_stories_support(skill_project, skill_trees)
+            if require_tickets:
+                findings += install.missing_tickets_support(skill_project, skill_trees)
+    except legacy_runtime.RuntimeError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return False
     # Severity decides. A review layer we can't statically resolve (a `when` gate,
     # an unrecognized handoff phrasing, an unparseable override) is reported and
     # then stepped over: aborting on it would be the false FAIL of #260, only now
@@ -4055,6 +4104,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         plugin_grants,
         require_stories=traits.stories_primitive,
         require_tickets=source == worksource.SOURCE_TICKETS,
+        source=source,
     ):
         return 1
 
@@ -5282,6 +5332,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         plugin_grants,
         require_stories=worksource.resumed_traits_for(state.source).stories_primitive,
         require_tickets=tickets,
+        source=state.source,
         review_owed=any(t.salvage_refile_pending for t in state.tasks.values()),
     ):
         return 1
@@ -7199,7 +7250,12 @@ def _resolve_reverify_finished(
         return rc
     plugin_grants = _launch_plugin_grants(project)  # read ONCE, for both preflights
     if not _require_base_skills(
-        project, pol, paths.repo_root, plugin_grants, review_owed=task.salvage_refile_pending
+        project,
+        pol,
+        paths.repo_root,
+        plugin_grants,
+        review_owed=task.salvage_refile_pending,
+        source=state.source,
     ):
         return 1
     # #496/#497: the resume's plugin-trust preflight, mirrored ahead of the mint.

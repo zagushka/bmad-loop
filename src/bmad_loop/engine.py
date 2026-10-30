@@ -789,7 +789,9 @@ def _harvest_row(
     )
 
 
-def _publication_refusal(path: Path, family: Literal["ledger", "store"]) -> (
+def _publication_refusal(
+    path: Path, family: Literal["ledger", "store"]
+) -> (
     tuple[
         Literal["target-absent", "target-unreadable", "target-not-a-file", "target-undecodable"],
         str | None,
@@ -1324,9 +1326,7 @@ class Engine:
                 self._stopping = True  # swallow stop signals landing mid-teardown
                 try:
                     self._kill_run_session()
-                except (
-                    BaseException
-                ):  # nosec B110 - best-effort teardown; the stop must still record
+                except BaseException:  # nosec B110 - best-effort teardown; the stop must still record
                     pass
                 if self._is_nested:
                     raise
@@ -1350,9 +1350,7 @@ class Engine:
                     pass
                 try:
                     self._kill_run_session()
-                except (
-                    Exception
-                ):  # nosec B110 - best-effort teardown; a crashing run must still record
+                except Exception:  # nosec B110 - best-effort teardown; a crashing run must still record
                     pass
                 if self._is_nested:
                     raise  # nested auto-sweep: let the owner record the failure
@@ -1369,9 +1367,7 @@ class Engine:
                         message=message,
                         epic=self.state.current_epic,
                     )
-                except (
-                    Exception
-                ):  # nosec B110 - journal write is best-effort; crash.txt + state flag already persisted
+                except Exception:  # nosec B110 - journal write is best-effort; crash.txt + state flag already persisted
                     pass
             finally:
                 # Any pending stop-request control file that outlived this run is
@@ -4800,6 +4796,7 @@ class Engine:
         record regenerated across midnight carries a new ``parked_at``).
         ``commit_sha`` is stamped only here and is write-only (never routing),
         so the empty persisted value is harmless."""
+        self._worktree_flow.guard_legacy_runtime(task, self.workspace.root)
         message = self._commit_message(task)
         # pre_commit: a plugin may rewrite the commit message or escalate (pause).
         # A defer/skip veto would have to unwind a COMMITTING task (no legal move
@@ -8491,6 +8488,34 @@ class Engine:
         preserve_dispatched_spec_snapshot: bool = False,
         prelaunch_validator: Callable[[], None] | None = None,
     ) -> SessionResult:
+        self._worktree_flow.guard_legacy_runtime(task, self.workspace.root)
+        try:
+            return self._run_session_impl(
+                task,
+                role,
+                prompt,
+                seq,
+                session_stage,
+                label,
+                spec_snapshot,
+                preserve_dispatched_spec_snapshot,
+                prelaunch_validator,
+            )
+        finally:
+            self._worktree_flow.guard_legacy_runtime(task, self.workspace.root)
+
+    def _run_session_impl(
+        self,
+        task: StoryTask,
+        role: str,
+        prompt: str,
+        seq: int,
+        session_stage: str | None = None,
+        label: str | None = None,
+        spec_snapshot: SpecSnapshot | None = None,
+        preserve_dispatched_spec_snapshot: bool = False,
+        prelaunch_validator: Callable[[], None] | None = None,
+    ) -> SessionResult:
         # A session may change the environment a probe pass vouched for, so no
         # pass survives a launch (DW-523).
         self._env_probes_fresh_root = None
@@ -8825,9 +8850,7 @@ class Engine:
                         # is what keeps an empty document persisting as `{}`
                         # rather than collapsing to `None`, which a truthiness
                         # test on `rj` would silently do (DW-206).
-                        dict(rj)
-                        if resumable and result.result_json is not None
-                        else None
+                        dict(rj) if resumable and result.result_json is not None else None
                     ),
                     label=label or "",
                 )

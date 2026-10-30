@@ -82,6 +82,13 @@ default_ref = "StoriesPolicy.spec_folder"
 label = "spec folder"
 description = "stories mode only: project-relative path to the epic spec folder (holds stories.yaml + SPEC.md)"
 
+[[section.field]]
+key = "legacy_runtime"
+kind = "str"
+default_ref = "StoriesPolicy.legacy_runtime"
+label = "legacy runtime"
+description = "Verified runtime bundle path for retained sprint/stories work; ignored for tickets"
+
 [[section]]
 name = "tickets"
 description = "BMAD v7 ticket-tree runs (stories.source = tickets)"

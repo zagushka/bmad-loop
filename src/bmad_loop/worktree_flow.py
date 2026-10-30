@@ -41,6 +41,7 @@ from . import (
     ticketstore,
     verify,
     worksource,
+    legacy_runtime,
     workspace_trust,
 )
 from .adapters.profile import ProfileError
@@ -75,6 +76,7 @@ from .install import (
     missing_stories_support,
     renderer_stub_resolved,
     resolve_review_layers,
+    skill_dependency_closure,
 )
 from .install import skills_root as _skills_root
 from .install import (
@@ -342,7 +344,9 @@ def _uncarried_ledger_changes(
 def _worktree_skill_copy_candidates(repo_root: Path, tree: str) -> tuple[str, ...]:
     """Every upstream skill worth best-effort copying into ``tree``."""
     resolved = resolve_review_layers(repo_root, tree)
-    return tuple(dict.fromkeys((*BASE_SKILLS, *(resolved.skills() if resolved else ()))))
+    candidates = tuple(dict.fromkeys((*BASE_SKILLS, *(resolved.skills() if resolved else ()))))
+    present = [name for name in candidates if (repo_root / tree / name / "SKILL.md").is_file()]
+    return tuple(dict.fromkeys((*candidates, *skill_dependency_closure(repo_root, tree, present))))
 
 
 def _required_worktree_skills(repo_root: Path, tree: str) -> tuple[str, ...]:
@@ -361,7 +365,9 @@ def _required_worktree_skills(repo_root: Path, tree: str) -> tuple[str, ...]:
         review_skills = (MERGED_REVIEW_SKILL,)
     else:
         review_skills = tuple(sorted(_REVIEW_LAYER_SKILLS))
-    return tuple(dict.fromkeys((dev_primitive_or_default(repo_root, tree), *review_skills)))
+    return skill_dependency_closure(
+        repo_root, tree, (dev_primitive_or_default(repo_root, tree), *review_skills)
+    )
 
 
 def _escape_exclude_pattern(pattern: str) -> str:
@@ -663,6 +669,11 @@ def _pinned_config_edits(worktree: Path, pins: dict[str, dict[str, str]]) -> lis
         recorded_text = str(entry.get("text", ""))
         dialect = str(entry.get("dialect", ""))
         path = worktree / rel
+        if dialect == "legacy-runtime" and (
+            path.is_symlink() or not path.resolve().is_relative_to(worktree.resolve())
+        ):
+            edits.append(f"{rel}: runtime path redirected while pinned")
+            continue
         try:
             raw = path.read_bytes()
         except FileNotFoundError:
@@ -677,6 +688,9 @@ def _pinned_config_edits(worktree: Path, pins: dict[str, dict[str, str]]) -> lis
             edits.append(f"{rel}: not valid UTF-8 ({e})")
             continue
         if text == recorded_text:
+            continue
+        if dialect == "legacy-runtime":
+            edits.append(f"{rel}: verified legacy runtime bytes changed")
             continue
         try:
             current = json.loads(text)
@@ -790,7 +804,11 @@ def _pinned_config_forensics(worktree: Path, pins: dict[str, dict[str, str]]) ->
 
 
 def _seed_bmad_tree(
-    worktree: Path, repo_root: Path, *, project: Path | None = None
+    worktree: Path,
+    repo_root: Path,
+    *,
+    project: Path | None = None,
+    skill_source: Path | None = None,
 ) -> tuple[list[str], list[str]]:
     """Merge the repo's project-local BMAD surface into an isolated worktree.
 
@@ -825,7 +843,7 @@ def _seed_bmad_tree(
     """
     source_root, mount_root = provision_roots(worktree, repo_root, project)
     bmad_rel = _shield_rel(worktree, mount_root, BMAD_DIR)
-    src_root = source_root / BMAD_DIR
+    src_root = (skill_source or source_root) / BMAD_DIR
     if not _is_dir(src_root):
         return [], []
     dst_root = mount_root / BMAD_DIR
@@ -848,7 +866,7 @@ def _seed_bmad_tree(
                 dst,
                 skip_existing=True,
                 worktree=worktree,
-                repo_root=repo_root,
+                repo_root=skill_source or repo_root,
             ):
                 seeded.append(f"{bmad_rel}/{rel}")
     if not seeded:
@@ -930,6 +948,8 @@ def base_skills_seed_incomplete(
     trees: Sequence[str],
     *,
     project: Path | None = None,
+    runtime: Path | None = None,
+    skill_source: Path | None = None,
 ) -> list[str]:
     """Required upstream skill rels present in the repo but absent in the worktree.
 
@@ -952,7 +972,13 @@ def base_skills_seed_incomplete(
 
     The skill trees are project-local: probed under :func:`provision_roots`.
     """
+    if runtime is not None:
+        with legacy_runtime.surface(project or repo_root, runtime) as source:
+            return base_skills_seed_incomplete(
+                worktree, repo_root, trees, project=project, skill_source=source
+            )
     src_root, dst_root = provision_roots(worktree, repo_root, project)
+    src_root = skill_source or src_root
     missing: list[str] = []
     for tree in dict.fromkeys(trees):
         primitive = dev_primitive_or_default(src_root, tree)
@@ -968,6 +994,8 @@ def base_skills_seed_incomplete(
             if not _is_file(worktree_skill / "SKILL.md"):
                 missing.append(f"{tree}/{skill}")
                 continue
+            if _is_file(repo_skill / "bmod.toml") and not _is_file(worktree_skill / "bmod.toml"):
+                missing.append(f"{tree}/{skill}/bmod.toml")
             if skill != primitive:
                 continue
             missing.extend(
@@ -1187,6 +1215,66 @@ def module_skills_seed_undelivered(
     return undelivered
 
 
+def _install_fresh_legacy_runtime(
+    worktree: Path,
+    repo_root: Path,
+    project: Path | None,
+    runtime: Path,
+    profiles: Sequence[CLIProfile],
+    on_pinned: Callable[[str, str, str], None] | None,
+) -> None:
+    """Overlay a newly created checkout, pinning and recording every runtime file."""
+    legacy_runtime.verify(runtime)
+    _, mount = provision_roots(worktree, repo_root, project)
+    trees = {profile.skill_tree for profile in profiles}
+    manifest = json.loads((runtime / "manifest.json").read_text(encoding="utf-8"))["files"]
+    payloads: dict[str, str] = {}
+    for rel in manifest:
+        if not (rel.startswith("_bmad/") or any(rel.startswith(tree + "/") for tree in trees)):
+            continue
+        if (
+            rel == CENTRAL_CONFIG_REL
+            or rel.startswith("_bmad/custom/")
+            or rel.endswith(".user.toml")
+        ):
+            raise legacy_runtime.RuntimeError(
+                f"legacy bundle contains live project configuration: {rel}"
+            )
+        path = mount / rel
+        # No component may redirect a runtime write, including within the worktree.
+        if any(parent.is_symlink() for parent in (path, *path.parents)):
+            raise verify.GitError(f"cannot overlay a symlinked runtime path: {path}")
+        if not path.resolve().is_relative_to(worktree.resolve()):
+            raise verify.GitError(f"legacy runtime destination escapes worktree: {path}")
+        payloads[rel] = (runtime / rel).read_bytes().decode("utf-8")
+    marker_rel = ".bmad-loop/legacy-runtime.json"
+    payloads[marker_rel] = json.dumps({"runtime": str(runtime)}, sort_keys=True) + "\n"
+    for rel in payloads:
+        path = mount / rel
+        if any(
+            parent.is_symlink() for parent in (path, *path.parents)
+        ) or not path.resolve().is_relative_to(worktree.resolve()):
+            raise verify.GitError(f"unsafe legacy runtime destination: {path}")
+    for rel, text in payloads.items():
+        dst = mount / rel
+        pinned_rel = dst.relative_to(worktree).as_posix()
+        # Fail on an indeterminate index, never degrade a tracked runtime rewrite.
+        tracked = verify.path_tracked_file(worktree, pinned_rel)
+        if tracked:
+            pinned, fault = _pin_tracked_config_rewrite(worktree, pinned_rel)
+            if not pinned or fault:
+                raise verify.GitError(f"cannot pin legacy runtime file {pinned_rel}: {fault}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(dst, text, require_writable_target=True)
+        if on_pinned is not None:
+            on_pinned(pinned_rel, "legacy-runtime", text)
+    fault = _worktree_local_exclude(
+        worktree, ["/" + (mount / rel).relative_to(worktree).as_posix() for rel in payloads]
+    )
+    if fault:
+        raise verify.GitError(f"cannot shield legacy runtime: {fault}")
+
+
 def provision_worktree(
     worktree: Path,
     profiles: Sequence[CLIProfile],
@@ -1197,6 +1285,45 @@ def provision_worktree(
     on_degraded: Callable[[str], None] | None = None,
     on_pinned: Callable[[str, str, str], None] | None = None,
     project: Path | None = None,
+    runtime: Path | None = None,
+    fresh: bool = False,
+) -> list[str]:
+    marker = provision_roots(worktree, repo_root, project)[1] / ".bmad-loop/legacy-runtime.json"
+    # Reopening/provisioning a retained worker must never seed over its runtime.
+    if runtime is not None and (not fresh or marker.exists()):
+        return []
+    try:
+        if runtime is not None:
+            _install_fresh_legacy_runtime(
+                worktree, repo_root, project, runtime, profiles, on_pinned
+            )
+        with legacy_runtime.surface(project or repo_root, runtime) as source:
+            return _provision_worktree(
+                worktree,
+                profiles,
+                repo_root,
+                seed_files,
+                seed_globs,
+                on_degraded=on_degraded,
+                on_pinned=on_pinned,
+                project=project,
+                skill_source=source if runtime is not None else None,
+            )
+    except (legacy_runtime.RuntimeError, ValueError) as exc:
+        raise verify.GitError(str(exc)) from exc
+
+
+def _provision_worktree(
+    worktree: Path,
+    profiles: Sequence[CLIProfile],
+    repo_root: Path,
+    seed_files: Sequence[str] = (),
+    seed_globs: Sequence[str] = (),
+    *,
+    on_degraded: Callable[[str], None] | None = None,
+    on_pinned: Callable[[str, str, str], None] | None = None,
+    project: Path | None = None,
+    skill_source: Path | None = None,
 ) -> list[str]:
     """Make a freshly-created git worktree a self-sufficient bmad-loop project.
 
@@ -1315,6 +1442,8 @@ def provision_worktree(
     def shield(rel: str) -> str:
         return _shield_rel(worktree, dst_root, rel)
 
+    upstream_root = skill_source or src_root
+    upstream_boundary = skill_source or repo_root
     skills_root = _skills_root()
 
     # project gitignored MCP/CLI configs: copy from the main repo when absent.
@@ -1455,7 +1584,9 @@ def provision_worktree(
     # also the session cwd (DW-484). Merge
     # the repo's project-local BMAD surface after explicit seeds (operator intent wins
     # on collisions) and reserve the two renderer sentinels for result-side checks.
-    seeded_bmad, bmad_written = _seed_bmad_tree(worktree, repo_root, project=project)
+    seeded_bmad, bmad_written = _seed_bmad_tree(
+        worktree, repo_root, project=project, skill_source=skill_source
+    )
     written.update(bmad_written)
     skipped = [rel for rel in skipped if rel not in RENDERER_SEED_SENTINELS]
     if _bmad_scripts_seed_incomplete(worktree, repo_root, project=project):
@@ -1512,13 +1643,13 @@ def provision_worktree(
         # Validating a skill here and then not copying it is how preflight passes in
         # the main checkout while the isolated review fails on a skill that was
         # never there.
-        for skill in _worktree_skill_copy_candidates(src_root, tree):
+        for skill in _worktree_skill_copy_candidates(upstream_root, tree):
             dst = tree_dir / skill
             try:
-                src = (src_root / tree / skill).resolve()
+                src = (upstream_root / tree / skill).resolve()
             except (OSError, RuntimeError, ValueError):
                 continue
-            if not src.is_relative_to(repo_root) or not _is_dir(src):
+            if not src.is_relative_to(upstream_boundary) or not _is_dir(src):
                 continue
             landed = []
             _copy_traversable(
@@ -1526,7 +1657,7 @@ def provision_worktree(
                 dst,
                 skip_existing=True,
                 worktree=worktree,
-                repo_root=repo_root,
+                repo_root=upstream_boundary,
                 copied_paths=landed,
             )
             written.update(_written_rels(worktree, landed))
@@ -1535,7 +1666,11 @@ def provision_worktree(
     # can happen to spell a skill rel, so only this disk predicate may arm the gate.
     skipped.extend(
         base_skills_seed_incomplete(
-            worktree, repo_root, [profile.skill_tree for profile in profiles], project=project
+            worktree,
+            repo_root,
+            [profile.skill_tree for profile in profiles],
+            project=project,
+            skill_source=skill_source,
         )
     )
 
@@ -2653,8 +2788,10 @@ class WorktreeFlow:
                 on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
                 on_pinned=_record_pin,
                 project=self.paths.project,
+                runtime=legacy_runtime.selected(self.paths.project, self.policy, self.state.source),
+                fresh=True,
             )
-        except verify.GitError as e:
+        except (verify.GitError, legacy_runtime.RuntimeError) as e:
             # Every provisioning refusal carries its own cause — an unresolvable
             # root, a config pin that could not be recorded, an unparseable seeded
             # hook config (#592) — so the wrapper names the unit and defers the
@@ -2695,6 +2832,7 @@ class WorktreeFlow:
         # a story's own edit to that file from the unit commit. A fresh open, so
         # always overwritten.
         task.pinned_config_rewrites = pinned_rewrites
+        self.guard_legacy_runtime(task, unit.path)
         if skipped_seeds:
             # A seed entry whose destination already exists is a no-op. Harmless for
             # a file the checkout legitimately carries, but a directory entry is
@@ -2781,7 +2919,11 @@ class WorktreeFlow:
         # which a user-authored seed rel could otherwise forge. Check this first so a
         # wholly absent primitive is not misdiagnosed as a renderer-surface problem.
         absent_skills = base_skills_seed_incomplete(
-            unit.path, self.paths.repo_root, trees, project=self.paths.project
+            unit.path,
+            self.paths.repo_root,
+            trees,
+            project=self.paths.project,
+            runtime=legacy_runtime.selected(self.paths.project, self.policy, self.state.source),
         )
         if absent_skills:
             reason = (
@@ -3494,6 +3636,16 @@ class WorktreeFlow:
             cause=exc,
         )
 
+    def guard_legacy_runtime(self, task: StoryTask, worktree: Path) -> None:
+        """Keep altered runtime bytes out of sessions, commits and publication."""
+        pins = {
+            rel: entry
+            for rel, entry in task.pinned_config_rewrites.items()
+            if entry.get("dialect") == "legacy-runtime"
+        }
+        if edits := _pinned_config_edits(worktree, pins):
+            self._pause("verified legacy runtime changed: " + "; ".join(edits), task.story_key)
+
     def merge_local(
         self,
         task: StoryTask,
@@ -3504,6 +3656,7 @@ class WorktreeFlow:
         first_integration: bool = False,
     ) -> None:
         """Merge a DONE unit's branch into the target branch from the main repo."""
+        self.guard_legacy_runtime(task, unit.path)
         self.require_target_checked_out(task)
         if first_integration:
             self._emit("pre_integrate", task)
@@ -3659,7 +3812,9 @@ class WorktreeFlow:
             else (
                 str(attempt["pre_target_revision"])
                 if attempt is not None
-                else verify.ref_revision(repo, target_ref) if receipt_required else target
+                else verify.ref_revision(repo, target_ref)
+                if receipt_required
+                else target
             )
         )
 
@@ -5280,6 +5435,7 @@ class WorktreeFlow:
         # Absolute outside-worktree paths pass through unchanged. The rule itself
         # lives on the class that creates the relative spelling, so this and
         # `Engine._finish_inflight`'s pre-discard re-anchor cannot drift apart.
+        self.guard_legacy_runtime(task, wt)
         task.rebase_spec_paths_on(self._mount_project(wt))
         # A unit first provisioned while the root was untrusted (or whose entry
         # the operator pruned) must pick up the grant on resume (DW-390).

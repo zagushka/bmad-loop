@@ -12086,9 +12086,9 @@ def test_resolve_finished_run_replays_the_kept_unit_of_a_moved_project(
     marker.write_text("up\n")
     _mock_adapters(monkeypatch)
 
-    assert (
-        _resolve_finished(project, engine, "--story", "1-1-a", "--resume") == 0
-    ), capsys.readouterr().err
+    assert _resolve_finished(project, engine, "--story", "1-1-a", "--resume") == 0, (
+        capsys.readouterr().err
+    )
 
     [replay_dir] = _replay_dirs(engine)
     replay = load_state(replay_dir)
@@ -14000,3 +14000,31 @@ def test_t2_unversioned_journals_under_mark_done_never(project_v7, monkeypatch):
     assert _plan_status(plan) == "built" and not tree.marks
     assert not _kinds(engine, "ticket-mark-latched")
     assert [e["layout"] for e in _kinds(engine, "store-unversioned")] == ["T2"]
+
+
+def test_reopen_preserves_runtime_after_current_policy_selects_legacy_bundle(project, monkeypatch):
+    """A retained mount keeps its runtime and its existing byte checks on reopen."""
+    from bmad_loop.policy import StoriesPolicy
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    configured = replace(wt_policy(), stories=StoriesPolicy(legacy_runtime="/missing/new-runtime"))
+    engine, _ = make_engine(project, [], policy=configured)
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    runtime_file = unit.path / "retained-runtime.py"
+    runtime_file.write_text("original runtime\n", encoding="utf-8")
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_VERIFY)
+    task.worktree_path, task.branch = str(unit.path), unit.branch
+    task.pinned_config_rewrites = {
+        "retained-runtime.py": {"dialect": "legacy-runtime", "text": "original runtime\n"}
+    }
+    monkeypatch.setattr(
+        worktree_flow,
+        "provision_worktree",
+        lambda *a, **kw: pytest.fail("retained mount was re-provisioned"),
+    )
+    reopened = engine._reopen_unit(task)
+    assert reopened.path == unit.path
+    assert runtime_file.read_text(encoding="utf-8") == "original runtime\n"

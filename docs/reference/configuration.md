@@ -67,6 +67,7 @@ Story-queue source: classic sprint board vs. folder+id dispatch.
 | --- | --- | --- | --- | --- |
 | `source` | string | `"sprint-status"` | `sprint-status` / `stories` / `tickets` | sprint-status: walk sprint-status.yaml · stories: folder+id dispatch off a typed stories.yaml (needs spec_folder) · tickets: the BMAD v7 ticket tree of core.active_initiative, via _bmad/method/scripts/tickets.py (experimental) |
 | `spec_folder` | string | `""` |  | stories mode only: project-relative path to the epic spec folder (holds stories.yaml + SPEC.md) |
+| `legacy_runtime` | string | `""` |  | Verified runtime bundle path for retained sprint/stories work; ignored for tickets |
 
 ### `[tickets]`
 
@@ -278,3 +279,21 @@ Terminal-multiplexer backend (machine-specific — policy.toml is gitignored).
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: policy-reference -->
+
+## Legacy runtimes for retained queues
+
+For retained sprint/stories queues in a v7 project, set `legacy_runtime` to a
+preserved runtime bundle and use `scm.isolation = "worktree"`. The bundle has the
+project layout (`_bmad/` and the required CLI skill trees), plus `manifest.json`
+containing a nonempty `files` map of relative file paths to SHA-256 hashes.
+Symlinks, unlisted files and changed bytes are refused. A content-addressed
+`legacy-<manifest-hash>` directory also binds the manifest to its location.
+Exclude generated renders, caches, personal settings and project configuration;
+the live `_bmad/config.toml` and `_bmad/custom/` remain authoritative.
+
+Ticket queues use current project skills. Resume selects the runtime from the
+persisted run source. A new legacy worker overlays verified runtime files in its
+own checkout, pins tracked replacements and records exact bytes for checks before
+and after sessions, commits and merges. Reopened workers keep their runtime files;
+provisioning does not seed over a retained runtime. There is no v7 fallback when
+a configured bundle is missing or altered.
