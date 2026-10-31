@@ -46,9 +46,9 @@ def _rpc(root: Path, data: dict, status: str = "trusted") -> dict:
 @pytest.mark.parametrize("event", ["SessionStart", "Stop"])
 def test_trust_rejects_old_script_command_for_each_required_event(tmp_path, monkeypatch, event):
     data = _config(tmp_path)
-    data["hooks"][event][0]["hooks"][0][
-        "command"
-    ] = f"python3 {tmp_path / '.bmad-loop/bmad_loop_hook.py'} {event}"
+    data["hooks"][event][0]["hooks"][0]["command"] = (
+        f"python3 {tmp_path / '.bmad-loop/bmad_loop_hook.py'} {event}"
+    )
     (tmp_path / ".codex/hooks.json").write_text(json.dumps(data))
     monkeypatch.setattr(
         codex_trust,
@@ -68,6 +68,23 @@ def test_trust_ignores_unrelated_command_containing_bmad_loop(tmp_path, monkeypa
     monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "codex-stub")
     monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: _rpc(tmp_path, data))
     assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "trusted"
+
+
+@pytest.mark.parametrize("linked_directory", [False, True])
+def test_trust_rejects_symlinked_project_hook_config(tmp_path, monkeypatch, linked_directory):
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    data = _config(outside)
+    if linked_directory:
+        (project / ".codex").symlink_to(outside / ".codex", target_is_directory=True)
+    else:
+        (project / ".codex").mkdir()
+        (project / ".codex/hooks.json").symlink_to(outside / ".codex/hooks.json")
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "codex-stub")
+    monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: _rpc(project, data))
+    assert codex_trust.project_hook_trust(project, get_profile("codex")).status != "trusted"
 
 
 def test_trust_rejects_installed_relay_at_wrong_path(tmp_path, monkeypatch):
@@ -242,9 +259,9 @@ def test_trust_refuses_relay_for_old_checkout_and_startup_excluding_matcher(tmp_
     assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "untrusted"
 
     data["hooks"]["SessionStart"][0].pop("matcher")
-    data["hooks"]["Stop"][0]["hooks"][0][
-        "command"
-    ] = f"python3 {tmp_path / 'old-checkout/.bmad-loop/bmad_loop_hook.py'} Stop"
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = (
+        f"python3 {tmp_path / 'old-checkout/.bmad-loop/bmad_loop_hook.py'} Stop"
+    )
     (tmp_path / ".codex/hooks.json").write_text(json.dumps(data), encoding="utf-8")
     assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "untrusted"
 
@@ -378,8 +395,7 @@ def test_validate_refuses_codex_stage_extra_args_that_change_hook_root(
     capsys.readouterr()
     policy = project.project / ".bmad-loop/policy.toml"
     policy.write_text(
-        f'[adapter]\nname = "codex"\n[adapter.{role}]\n'
-        'extra_args = ["-C", "/another/project"]\n',
+        f'[adapter]\nname = "codex"\n[adapter.{role}]\nextra_args = ["-C", "/another/project"]\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(

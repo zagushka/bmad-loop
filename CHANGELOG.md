@@ -203,6 +203,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Reject symlinked or non-local Codex hook configurations before checking trust.
+
 - Accept fresh v7 workflow-body renders, carry declared module and hub dependencies,
   and select a verified legacy runtime for retained sprint/stories queues without
   reseeding retained workers.

@@ -272,7 +272,14 @@ def project_hook_trust(
         profile.bypass_args
     ):
         return TrustResult("unverifiable", "hook trust cannot verify profile launch arguments")
-    config_path = (project / profile.hooks.config_path).resolve()
+    try:
+        root = project.resolve()
+        raw_config = root / profile.hooks.config_path
+        config_path = raw_config.resolve()
+        if not raw_config.is_relative_to(root) or config_path != raw_config:
+            return TrustResult("unverifiable", "hook trust config is not local to the project")
+    except (OSError, RuntimeError, ValueError):
+        return TrustResult("unverifiable", "hook trust config path is invalid")
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError):
