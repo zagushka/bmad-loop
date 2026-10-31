@@ -22,7 +22,7 @@ import traceback
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from stat import S_ISREG
+from stat import S_ISDIR, S_ISREG
 from typing import TYPE_CHECKING, Callable, Literal, NamedTuple, NoReturn, Protocol, Sequence
 
 from . import (
@@ -203,6 +203,15 @@ class _UnreadableLedger:
     """
 
     error: str
+
+
+@dataclass(frozen=True)
+class _SessionReservation:
+    """The one counter reservation a pre-launch refusal may cancel."""
+
+    counter: Literal["attempt", "review_cycle"]
+    before: int
+    followup_reviews_spent_before: int | None = None
 
 
 # `isinstance` tuple for the two typed degraded answers of `_ledger_text`.
@@ -1498,6 +1507,59 @@ class Engine:
         if self.workspace.root == self.paths.repo_root:
             return None
         return mount_root_identity(root, mount=self.workspace.root, recorded=task.worktree_identity)
+
+    def _check_mounted_worktree_identity(
+        self, task: StoryTask, reservation: _SessionReservation | None = None
+    ) -> None:
+        """Refuse a mounted session unless its root still matches its mint record."""
+        if self.workspace.root == self.paths.repo_root:
+            return
+        recorded = task.worktree_identity
+        try:
+            mount_path_is_canonical = Path(os.path.abspath(self.workspace.root)) == (
+                self.workspace.root.resolve(strict=True)
+            )
+        except (OSError, RuntimeError):
+            mount_path_is_canonical = False
+        observed = self._mount_root_identity(task, self.workspace.root)
+        project = self._mount_root_identity(task, self.workspace.paths.project)
+        if (
+            mount_path_is_canonical
+            and recorded is not None
+            and observed is not None
+            and S_ISDIR(observed.st_mode)
+            and (observed.st_dev, observed.st_ino) == recorded
+            and project is not None
+            and S_ISDIR(project.st_mode)
+        ):
+            return
+
+        reason = (
+            f"mounted worktree identity does not match its mint-time record for {task.story_key}"
+        )
+        if reservation is not None:
+            expected = reservation.before + 1
+            counters = [(reservation.counter, expected, reservation.before)]
+            if reservation.followup_reviews_spent_before is not None:
+                counters.append(
+                    (
+                        "followup_reviews_spent",
+                        reservation.followup_reviews_spent_before + 1,
+                        reservation.followup_reviews_spent_before,
+                    )
+                )
+            changed = False
+            for name, value, before in counters:
+                if getattr(task, name) == value:
+                    setattr(task, name, before)
+                else:
+                    changed = True
+            if changed:
+                reason += "; dispatch counters changed before cancellation"
+
+        # WorktreeFlow handles illegal phase transitions, close cleanup, and
+        # preserves the mounted unit while making the task terminal.
+        self._worktree_flow.escalate_unit(task, reason)
 
     def _ensure_target_branch(self) -> None:
         self._worktree_flow.ensure_target_branch()
@@ -3013,7 +3075,13 @@ class Engine:
             )
 
     def _emit_session_gate(
-        self, task: StoryTask, role: str, prompt: str, env: dict[str, str], session_stage: str
+        self,
+        task: StoryTask,
+        role: str,
+        prompt: str,
+        env: dict[str, str],
+        session_stage: str,
+        reservation: _SessionReservation | None = None,
     ) -> tuple[str, dict[str, str], HookContext | None]:
         """Fire the role-specific then generic session hooks before a session
         launches, sharing one context so the generic ``pre_session`` sees the
@@ -3028,8 +3096,10 @@ class Engine:
         # role-specific stage first (its mutations are visible to pre_session)
         ctx._stage = session_stage
         self._bus_emit(session_stage, ctx)
+        self._check_mounted_worktree_identity(task, reservation)
         ctx._stage = "pre_session"
         self._bus_emit("pre_session", ctx)
+        self._check_mounted_worktree_identity(task, reservation)
         if ctx.proposed_prompt is not None:
             prompt = ctx.proposed_prompt
         if ctx.proposed_env:
@@ -3445,13 +3515,18 @@ class Engine:
         if resume_result is None:
             # DW-523: probe before anything below mutates the task, so an
             # `environment` pause leaves nothing to roll back on resume.
+            self._check_mounted_worktree_identity(task)
             self._gate_dispatch(task, "dev")
+            # The probe is executable and can change the mount while it runs.
+            # Recheck before any attempt-owned mutation or counter reservation.
+            self._check_mounted_worktree_identity(task)
             # A fresh invocation cannot consume a snapshot armed by an earlier,
             # non-replayable invocation. Keep crash replay's snapshot intact.
             self._disarm_ledger_snapshot(task)
         if self._vetoed(self._emit("pre_dev_phase", task), task):
             return False
         if resume_result is None:
+            self._check_mounted_worktree_identity(task)
             task.baseline_commit = verify.rev_parse_head(self.workspace.root)
             # snapshot untracked files now so a later rollback removes only what
             # THIS attempt creates, never files the user already had on disk.
@@ -3468,11 +3543,14 @@ class Engine:
         feedback: Path | None = None
         while True:
             replayed = resume_result is not None
+            reservation: _SessionReservation | None = None
             if resume_result is None:
                 # a resumed result replays the attempt it was recorded under, so
                 # the counter (and the session task_id derived from it) must not
                 # advance; a second host death then still finds the record and
                 # re-enters this continuation instead of falling back to restart.
+                self._check_mounted_worktree_identity(task)
+                reservation = _SessionReservation("attempt", task.attempt)
                 task.attempt += 1
                 # A genuinely new attempt starts from a rolled-back tree and owes
                 # nothing to the rejected attempt's harvest. A fixable retry keeps
@@ -3559,6 +3637,7 @@ class Engine:
                     prompt=prompt,
                     seq=task.attempt,
                     preserve_dispatched_spec_snapshot=preserve_chain_snapshot,
+                    reservation=reservation,
                 )
             advance(task, Phase.DEV_VERIFY)
             outcome = None
@@ -3946,6 +4025,11 @@ class Engine:
         # the last pass's flag, which the uninterrupted loop never re-checks: a
         # done/followup-False pass whose verify gate failed fixably re-reviews
         # after its fix, and a non-terminal pass loops regardless of the flag.
+        if resume_result is None:
+            # A mounted result replay is existing session evidence; do not block
+            # its continuation here. Fresh review dispatches are gated before
+            # executable pre-review hooks and again after them.
+            self._check_mounted_worktree_identity(task)
         if (
             resume_result is None
             and not resumed_loop
@@ -3956,7 +4040,10 @@ class Engine:
             self.journal.append("review-not-recommended", story_key=task.story_key)
             self._skip_review_and_commit(task)
             return
-        if self._vetoed(self._emit("pre_review_phase", task), task):
+        pre_review_ctx = self._emit("pre_review_phase", task)
+        if resume_result is None:
+            self._check_mounted_worktree_identity(task)
+        if self._vetoed(pre_review_ctx, task):
             return
         clean = False
         # Tracks whether the last *completed* review pass left the story finalized
@@ -3979,10 +4066,20 @@ class Engine:
         # burned. resume_result is nulled after it is consumed, so every later
         # iteration falls back to the normal budget guard.
         while resume_result is not None or task.review_cycle < self.policy.limits.max_review_cycles:
+            reservation: _SessionReservation | None = None
             if resume_result is None:
                 # DW-523: probe before the cycle is charged; a pause here resumes
                 # through the DEV_VERIFY or completed-pass replay arms.
+                self._check_mounted_worktree_identity(task)
                 self._gate_dispatch(task, "review")
+                # A configured probe is executable and can change the mount, so
+                # check again before reserving this review cycle.
+                self._check_mounted_worktree_identity(task)
+                reservation = _SessionReservation(
+                    "review_cycle",
+                    task.review_cycle,
+                    task.followup_reviews_spent if spend_pending else None,
+                )
                 if spend_pending:
                     task.followup_reviews_spent += 1
                     spend_pending = False
@@ -4013,6 +4110,7 @@ class Engine:
                     prompt=self._review_prompt(task),
                     seq=task.review_cycle,
                     spec_snapshot=snapshot,
+                    reservation=reservation,
                 )
             advance(task, Phase.REVIEW_VERIFY)
             self._save()
@@ -8487,6 +8585,7 @@ class Engine:
         spec_snapshot: SpecSnapshot | None = None,
         preserve_dispatched_spec_snapshot: bool = False,
         prelaunch_validator: Callable[[], None] | None = None,
+        reservation: _SessionReservation | None = None,
     ) -> SessionResult:
         self._worktree_flow.guard_legacy_runtime(task, self.workspace.root)
         try:
@@ -8500,6 +8599,7 @@ class Engine:
                 spec_snapshot,
                 preserve_dispatched_spec_snapshot,
                 prelaunch_validator,
+                reservation,
             )
         finally:
             self._worktree_flow.guard_legacy_runtime(task, self.workspace.root)
@@ -8515,6 +8615,7 @@ class Engine:
         spec_snapshot: SpecSnapshot | None = None,
         preserve_dispatched_spec_snapshot: bool = False,
         prelaunch_validator: Callable[[], None] | None = None,
+        reservation: _SessionReservation | None = None,
     ) -> SessionResult:
         # A session may change the environment a probe pass vouched for, so no
         # pass survives a launch (DW-523).
@@ -8523,6 +8624,7 @@ class Engine:
         # its task_id stays distinct from the role's own dev/review attempts.
         task_id = _session_task_id(task.story_key, label if label else role, seq, task.generation)
         adapter = self.adapters[role]
+        self._check_mounted_worktree_identity(task, reservation)
         if self.workspace.root != self.paths.repo_root:
             # DW-341: Codex silently skips hooks it has not trusted for this exact
             # worktree path, so the session's Stop would never arrive. Checked here,
@@ -8589,17 +8691,23 @@ class Engine:
         # prompt + env or veto the session. A veto synthesizes a `vetoed` result
         # so the existing decide_dev/decide_review_session route it (retry → defer).
         prompt, env, sctx = self._emit_session_gate(
-            task, role, prompt, env, session_stage or f"pre_{role}_session"
+            task,
+            role,
+            prompt,
+            env,
+            session_stage or f"pre_{role}_session",
+            reservation=reservation,
         )
+        veto = sctx.resolved_veto() if sctx is not None else None
+        if veto is not None and prelaunch_validator is not None:
+            prelaunch_validator()
+        self._check_mounted_worktree_identity(task, reservation)
         if sctx is not None:
-            veto = sctx.resolved_veto()
             if veto is not None:
                 # A veto prevents adapter launch but does not undo executable
                 # hook side effects. Callers whose durable launch authority is
-                # bound to mutable input must validate that input before the
-                # early return just as they do on the normal launch path.
-                if prelaunch_validator is not None:
-                    prelaunch_validator()
+                # bound to mutable input validated that input above, just as on
+                # the normal launch path.
                 self.journal.append(
                     "plugin-veto",
                     stage=sctx.stage,
@@ -8691,6 +8799,7 @@ class Engine:
         # default keeps all existing callers byte-for-byte inert.
         if prelaunch_validator is not None:
             prelaunch_validator()
+        self._check_mounted_worktree_identity(task, reservation)
         spec = SessionSpec(
             task_id=task_id,
             role=role,
@@ -9499,6 +9608,8 @@ class Engine:
         session_failure = ""
         while task.attempt < self.policy.limits.max_dev_attempts:
             preserve_chain_snapshot = self._preserves_dispatched_spec_snapshot_for_repair(task)
+            self._check_mounted_worktree_identity(task)
+            reservation = _SessionReservation("attempt", task.attempt)
             task.attempt += 1
             feedback = self._write_feedback(task, reason)
             advance(task, Phase.DEV_RUNNING)
@@ -9517,6 +9628,7 @@ class Engine:
                 seq=task.attempt,
                 session_stage="pre_fix_session",
                 preserve_dispatched_spec_snapshot=preserve_chain_snapshot,
+                reservation=reservation,
             )
             advance(task, Phase.DEV_VERIFY)
             outcome = None

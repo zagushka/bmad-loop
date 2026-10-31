@@ -52,7 +52,13 @@ from bmad_loop import deferredwork, runs, sprintstatus, verify, worktree_flow
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
-from bmad_loop.engine import Engine, _publication_refusal, _story_label_stripped
+from bmad_loop.engine import (
+    Engine,
+    RunPaused,
+    _publication_refusal,
+    _session_task_id,
+    _story_label_stripped,
+)
 from bmad_loop.install import (
     BMAD_SCRIPTS_SEED_REL,
     CENTRAL_CONFIG_REL,
@@ -62,6 +68,7 @@ from bmad_loop.install import (
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.policy import (
+    EnvironmentPolicy,
     GatesPolicy,
     LimitsPolicy,
     NotifyPolicy,
@@ -1861,6 +1868,117 @@ def test_resume_arm_into_an_untrusted_codex_review_session_escalates_without_lau
     assert f"Codex hook trust is untrusted for the review session's worktree {wt}" in reason
     assert queried == [wt]
     assert wt.is_dir()  # kept for the operator to trust, re-arm, and resume
+
+
+def _crash_after_completed_mounted_session(project, role, *, review_clean=True):
+    """Leave a real mounted dev/review result in the post-session crash window."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    script = [wt_dev_effect(project, "1-1-a")]
+    if role == "review":
+        script.append(wt_review_effect(project, "1-1-a", clean=review_clean))
+    engine, _adapter = make_engine(project, script)
+    original_emit = engine._emit
+
+    def crash_after_role_result(stage, *args, **kwargs):
+        if stage == "post_session" and kwargs.get("role") == role:
+            raise RuntimeError(f"host died after completed {role} result")
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = crash_after_role_result
+    assert engine.run().crashed
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert task.phase == (Phase.DEV_RUNNING if role == "dev" else Phase.REVIEW_RUNNING)
+    assert task.sessions[-1].role == role and task.sessions[-1].status == "completed"
+    return engine, task
+
+
+@pytest.mark.parametrize("role", ["dev", "review"])
+def test_resume_refuses_completed_mounted_result_with_mismatched_identity(project, role):
+    """Replay remains valid, then a bad mint pin blocks the next model dispatch.
+
+    The locked resume reconciliation preserves a non-matching inode record. This
+    test calls that reconciliation explicitly because ``resume_engine`` mirrors the
+    engine construction step, not the CLI's run-lock boundary.
+    The review result asks for a follow-up, so its replay reaches another review
+    dispatch. Ablation: remove the fresh-dispatch identity gate and the next model
+    session launches from the invalid mount.
+    """
+    engine, crashed_task = _crash_after_completed_mounted_session(
+        project, role, review_clean=(role != "review")
+    )
+    previous_sessions = list(crashed_task.sessions)
+    previous_attempt = crashed_task.attempt
+    previous_cycle = crashed_task.review_cycle
+    state = load_state(engine.run_dir)
+    task = state.tasks["1-1-a"]
+    task.worktree_identity = (0, 0)
+    save_state(engine.run_dir, state)
+
+    reconciled = load_state(engine.run_dir)
+    runs.reconcile_root_identities(
+        reconciled, engine.run_dir, Journal(engine.run_dir), project.project
+    )
+    assert reconciled.tasks["1-1-a"].worktree_identity == (0, 0)
+    save_state(engine.run_dir, reconciled)
+
+    resumed, adapter = resume_engine(project, engine)
+    summary = resumed.run()
+
+    task = resumed.state.tasks["1-1-a"]
+    assert summary.paused
+    assert adapter.sessions == []
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == previous_attempt
+    assert task.review_cycle == previous_cycle
+    assert [row["role"] for row in resumed.journal.entries() if row["kind"] == "resume-verify"] == [
+        role
+    ]
+    assert "resume-restart" not in journal_kinds(resumed)
+    assert [(row.task_id, row.role, row.status) for row in task.sessions] == [
+        (row.task_id, row.role, row.status) for row in previous_sessions
+    ]
+    assert Path(task.worktree_path or "").is_dir()
+
+
+@pytest.mark.parametrize("role", ["dev", "review"])
+def test_resume_replays_completed_mounted_result_with_valid_identity(project, role):
+    """A valid mount reopens and consumes the saved result without replaying its session."""
+    engine, crashed_task = _crash_after_completed_mounted_session(project, role)
+    state = load_state(engine.run_dir)
+    task = state.tasks["1-1-a"]
+    if role == "dev":
+        # Historical state written before DW-446 has no pin. The real CLI performs
+        # this backfill under the run lock before constructing the resumed Engine.
+        task.worktree_identity = None
+        save_state(engine.run_dir, state)
+        reconciled = load_state(engine.run_dir)
+        assert runs.reconcile_root_identities(
+            reconciled, engine.run_dir, Journal(engine.run_dir), project.project
+        )
+        task = reconciled.tasks["1-1-a"]
+        assert task.worktree_identity == (
+            Path(task.worktree_path).stat().st_dev,
+            Path(task.worktree_path).stat().st_ino,
+        )
+        save_state(engine.run_dir, reconciled)
+
+    resumed, adapter = resume_engine(
+        project, engine, [wt_review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = resumed.run()
+
+    task = resumed.state.tasks["1-1-a"]
+    assert not summary.paused and task.phase == Phase.DONE
+    assert [row["role"] for row in resumed.journal.entries() if row["kind"] == "resume-verify"] == [
+        role
+    ]
+    if role == "dev":
+        assert len(adapter.sessions) == 1 and adapter.sessions[0].role == "review"
+        assert task.attempt == crashed_task.attempt
+    else:
+        assert adapter.sessions == []
+        assert task.review_cycle == crashed_task.review_cycle
+    assert [record.role for record in task.sessions].count(role) == 1
 
 
 @pytest.mark.parametrize("trust_status", ["trusted", "untrusted"])
@@ -11070,6 +11188,571 @@ def _nested_unit(project):
         paths.repo_root, paths, "test-run", "1-1-a", "main", "story", engine.run_dir
     )
     return paths, engine, unit
+
+
+def _mounted_dispatch(project, script):
+    """Prepare one mounted task for direct dev-dispatch boundary tests."""
+    from bmad_loop.platform_util import root_identity_record
+    from bmad_loop.workspace import open_unit_workspace
+
+    paths = nested_repo_root_paths(project)
+    commit_sprint(paths, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(paths, script)
+    engine.state.repo_root = str(paths.repo_root)
+    unit = open_unit_workspace(
+        paths.repo_root, paths, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    task = StoryTask("1-1-a", 1, worktree_path=str(unit.path), branch=unit.branch)
+    task.worktree_identity = root_identity_record(unit.path)
+    engine.state.tasks[task.story_key] = task
+    engine.workspace = unit.workspace
+    return engine, adapter, unit, task
+
+
+@pytest.mark.parametrize("identity", [None, (0, 0)], ids=["missing", "mismatched"])
+def test_mounted_dev_dispatch_refuses_missing_or_mismatched_identity_before_attempt(
+    project, identity
+):
+    """An invalid mint-time pin refuses before a dev attempt is reserved.
+
+    Ablation: remove the mounted identity gate before the attempt increment and this
+    row reaches the adapter with ``task.attempt == 1``.
+    """
+
+    class AdapterReached(Exception):
+        pass
+
+    def adapter_must_not_run(_spec):
+        raise AdapterReached
+
+    engine, adapter, _unit, task = _mounted_dispatch(project, [adapter_must_not_run])
+    task.worktree_identity = identity
+
+    refusal = None
+    try:
+        engine._dev_phase(task)
+    except Exception as exc:
+        refusal = exc
+
+    assert task.attempt == 0, "the refused session spent a dev attempt"
+    assert adapter.sessions == [], "the adapter started without a valid mint-time identity"
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+    assert engine._dev_attempt_dispatched(task) is False
+
+
+def _install_executable_probe(engine, tmp_path, marker, *, review=False):
+    probe_script = tmp_path / "mounted-probe.py"
+    probe_script.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    probe = f'"{sys.executable}" "{probe_script}"'
+    review_policy = (
+        replace(engine.policy.review, trigger="always") if review else engine.policy.review
+    )
+    engine.policy = replace(
+        engine.policy,
+        environment=EnvironmentPolicy(probes=(probe,)),
+        review=review_policy,
+    )
+
+
+def test_mounted_dev_identity_is_checked_before_executable_dispatch_probe(project, tmp_path):
+    """An invalid mount must not run the configured executable probe or adapter.
+
+    Ablation: move the first identity check after ``_gate_dispatch`` and the
+    executable probe creates its marker before the later refusal.
+    """
+    engine, adapter, _unit, task = _mounted_dispatch(project, [])
+    marker = tmp_path / "dev-probe-ran"
+    _install_executable_probe(engine, tmp_path, marker)
+    task.worktree_identity = (0, 0)
+
+    refusal = None
+    try:
+        engine._dev_phase(task)
+    except Exception as exc:
+        refusal = exc
+
+    assert not marker.exists(), "the executable probe ran before mount identity refusal"
+    assert adapter.sessions == [], "the adapter launched on an invalid mount"
+    assert task.attempt == 0
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+
+
+def test_mounted_review_identity_is_checked_before_executable_dispatch_probe(project, tmp_path):
+    """Review dispatch also refuses before an executable probe or adapter launch.
+
+    Ablation: move the first identity check after ``_gate_dispatch`` and the
+    executable probe creates its marker before the later refusal.
+    """
+    engine, adapter, unit, task = _mounted_dispatch(project, [])
+    marker = tmp_path / "review-probe-ran"
+    _install_executable_probe(engine, tmp_path, marker, review=True)
+    task.worktree_identity = (0, 0)
+    task.phase = Phase.DEV_VERIFY
+    task.spec_file = str(unit.workspace.paths.implementation_artifacts / "spec-1-1-a.md")
+    write_spec(Path(task.spec_file), "done", rev_parse_head(unit.path))
+
+    refusal = None
+    try:
+        engine._review_and_commit(task)
+    except Exception as exc:
+        refusal = exc
+
+    assert not marker.exists(), "the executable probe ran before mount identity refusal"
+    assert adapter.sessions == [], "the adapter launched on an invalid mount"
+    assert task.review_cycle == 0
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+
+
+def test_mounted_review_refuses_before_pre_review_hook_on_invalid_identity(project, monkeypatch):
+    """An invalid mount prevents the executable pre-review hook from running."""
+    engine, adapter, unit, task = _mounted_dispatch(project, [])
+    task.worktree_identity = (0, 0)
+    task.phase = Phase.DEV_VERIFY
+    task.followup_review_recommended = True
+    task.spec_file = str(unit.workspace.paths.implementation_artifacts / "spec-1-1-a.md")
+    write_spec(Path(task.spec_file), "done", rev_parse_head(unit.path))
+    hooks: list[str] = []
+    monkeypatch.setattr(engine._bus, "active", lambda stage: stage == "pre_review_phase")
+    monkeypatch.setattr(engine, "_bus_emit", lambda stage, _ctx: hooks.append(stage))
+
+    refusal = None
+    try:
+        engine._review_and_commit(task)
+    except Exception as exc:
+        refusal = exc
+
+    assert hooks == []
+    assert adapter.sessions == []
+    assert task.review_cycle == 0
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+
+
+def test_mounted_review_rechecks_identity_after_pre_review_hook(project, tmp_path, monkeypatch):
+    """A hook that invalidates the mount is stopped before probe and model dispatch."""
+    engine, adapter, unit, task = _mounted_dispatch(project, [])
+    marker = tmp_path / "review-hook-probe-ran"
+    _install_executable_probe(engine, tmp_path, marker, review=True)
+    task.phase = Phase.DEV_VERIFY
+    task.followup_review_recommended = True
+    task.spec_file = str(unit.workspace.paths.implementation_artifacts / "spec-1-1-a.md")
+    write_spec(Path(task.spec_file), "done", rev_parse_head(unit.path))
+    hooks: list[str] = []
+    monkeypatch.setattr(engine._bus, "active", lambda stage: stage == "pre_review_phase")
+
+    def invalidate_after_hook(stage, _ctx):
+        hooks.append(stage)
+        task.worktree_identity = (0, 0)
+        return True
+
+    monkeypatch.setattr(engine, "_bus_emit", invalidate_after_hook)
+    refusal = None
+    try:
+        engine._review_and_commit(task)
+    except Exception as exc:
+        refusal = exc
+
+    assert hooks == ["pre_review_phase"]
+    assert not marker.exists()
+    assert adapter.sessions == []
+    assert task.review_cycle == 0
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+
+
+def test_mounted_dev_retry_refusal_preserves_first_attempt(project, monkeypatch):
+    """A real failed dev attempt reaches retry, then the fresh gate stops attempt 2.
+
+    Ablation: remove only the identity check at the top of the retry loop and the
+    second attempt rebinds its artifact baseline before the later launch gate.
+    """
+
+    class AdapterReached(Exception):
+        pass
+
+    def adapter_must_not_run(_spec):
+        raise AdapterReached
+
+    engine, adapter, _unit, task = _mounted_dispatch(
+        project, [SessionResult(status="stalled"), adapter_must_not_run]
+    )
+    original_rollback = engine._rollback_or_pause
+
+    def rollback_then_invalidate(_task, **kwargs):
+        original_rollback(_task, **kwargs)
+        _task.worktree_identity = (0, 0)
+
+    monkeypatch.setattr(engine, "_rollback_or_pause", rollback_then_invalidate)
+    original_artifact_baseline = engine._artifact_baseline
+    artifact_baselines = 0
+
+    def count_artifact_baseline(_task):
+        nonlocal artifact_baselines
+        artifact_baselines += 1
+        return original_artifact_baseline(_task)
+
+    monkeypatch.setattr(engine, "_artifact_baseline", count_artifact_baseline)
+
+    refusal = None
+    try:
+        engine._dev_phase(task)
+    except Exception as exc:
+        refusal = exc
+
+    assert task.attempt == 1
+    assert artifact_baselines == 1, "the refused retry mutated attempt-owned state"
+    assert len(task.sessions) == 1
+    assert task.sessions[0].task_id == _session_task_id(task.story_key, "dev", 1, task.generation)
+    assert task.sessions[0].role == "dev" and task.sessions[0].status == "stalled"
+    assert len(adapter.sessions) == 1 and adapter.sessions[0].role == "dev"
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+    assert engine._dev_attempt_dispatched(task) is True
+
+
+@pytest.mark.parametrize("mount_state", ["missing", "replacement", "symlink"])
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_mounted_dev_dispatch_refuses_unusable_mount_before_attempt(project, tmp_path, mount_state):
+    """Missing, replaced, and linked mount paths fail closed before reservation.
+
+    Ablation: bypass the mounted identity gate and this row reaches the adapter.
+    """
+
+    class AdapterReached(Exception):
+        pass
+
+    def adapter_must_not_run(_spec):
+        raise AdapterReached
+
+    engine, adapter, unit, task = _mounted_dispatch(project, [adapter_must_not_run])
+    recorded = task.worktree_identity
+    aside = unit.path.with_name(f"{unit.path.name}-aside")
+    replacement = tmp_path / "replacement-mount"
+    if mount_state != "missing":
+        shutil.copytree(unit.path, replacement, symlinks=True)
+    unit.path.rename(aside)
+    if mount_state == "replacement":
+        replacement.rename(unit.path)
+    elif mount_state == "symlink":
+        unit.path.symlink_to(replacement, target_is_directory=True)
+
+    refusal = None
+    try:
+        engine._dev_phase(task)
+    except Exception as exc:
+        refusal = exc
+
+    assert task.attempt == 0
+    assert adapter.sessions == []
+    assert task.worktree_identity == recorded
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+    assert engine._dev_attempt_dispatched(task) is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_mounted_dev_dispatch_refuses_mount_symlink_to_minted_inode(project):
+    """A link to the original inode is still an aliased mount path.
+
+    Ablation: omit the canonical mount-path check and identity follows the link,
+    allowing the adapter to start from the original worktree through an alias.
+    """
+
+    class AdapterReached(Exception):
+        pass
+
+    def adapter_must_not_run(_spec):
+        raise AdapterReached
+
+    engine, adapter, unit, task = _mounted_dispatch(project, [adapter_must_not_run])
+    recorded = task.worktree_identity
+    aside = unit.path.with_name(f"{unit.path.name}-aside")
+    unit.path.rename(aside)
+    unit.path.symlink_to(aside, target_is_directory=True)
+
+    refusal = None
+    try:
+        engine._dev_phase(task)
+    except Exception as exc:
+        refusal = exc
+
+    assert task.attempt == 0
+    assert adapter.sessions == []
+    assert task.worktree_identity == recorded
+    assert aside.is_dir()
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+    assert engine._dev_attempt_dispatched(task) is False
+
+
+def test_mounted_dev_dispatch_refuses_unreadable_identity_before_attempt(project, monkeypatch):
+    """An unreadable mount walk returns the fail-closed sentinel, not a valid pin.
+
+    Ablation: bypass the mounted identity gate and this row reaches the adapter.
+    """
+    from bmad_loop import platform_util
+
+    class AdapterReached(Exception):
+        pass
+
+    def adapter_must_not_run(_spec):
+        raise AdapterReached
+
+    engine, adapter, _unit, task = _mounted_dispatch(project, [adapter_must_not_run])
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", True)
+    open_dir_confined = platform_util.open_dir_confined
+
+    def unreadable_mount(root, *args, **kwargs):
+        if Path(root) == Path(task.worktree_path):
+            return None
+        return open_dir_confined(root, *args, **kwargs)
+
+    monkeypatch.setattr(platform_util, "open_dir_confined", unreadable_mount)
+
+    refusal = None
+    try:
+        engine._dev_phase(task)
+    except Exception as exc:
+        refusal = exc
+
+    assert task.attempt == 0
+    assert adapter.sessions == []
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_mounted_dev_dispatch_refuses_nested_project_swapped_for_link(project):
+    """A nested session cwd must remain reachable inside its recorded mount.
+
+    Ablation: omit the ``workspace.paths.project`` identity walk and the session
+    runs from the linked main-checkout project.
+    """
+
+    class AdapterReached(Exception):
+        pass
+
+    def adapter_must_not_run(_spec):
+        raise AdapterReached
+
+    engine, adapter, unit, task = _mounted_dispatch(project, [adapter_must_not_run])
+    recorded = task.worktree_identity
+    nested_project = unit.workspace.paths.project
+    aside = nested_project.with_name(f"{nested_project.name}-aside")
+    nested_project.rename(aside)
+    nested_project.symlink_to(project.project, target_is_directory=True)
+
+    refusal = None
+    try:
+        engine._dev_phase(task)
+    except Exception as exc:
+        refusal = exc
+
+    assert task.attempt == 0
+    assert adapter.sessions == []
+    assert task.worktree_identity == recorded
+    assert aside.is_dir()
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+    assert engine._dev_attempt_dispatched(task) is False
+
+
+def test_mounted_fix_refusal_cancels_only_its_attempt(project, monkeypatch):
+    """A refused fix keeps the previous dev attempt and its session evidence.
+
+    Ablation: bypass the post-hook gate and the adapter starts at attempt 2.
+    """
+
+    class AdapterReached(Exception):
+        pass
+
+    def adapter_must_not_run(_spec):
+        raise AdapterReached
+
+    engine, adapter, _unit, task = _mounted_dispatch(project, [adapter_must_not_run])
+    task.phase = Phase.REVIEW_VERIFY
+    task.attempt = 1
+    prior = SessionRecord(
+        task_id=_session_task_id(task.story_key, "dev", 1, task.generation),
+        role="dev",
+        status="completed",
+        result_json={"prior": True},
+    )
+    task.sessions.append(prior)
+    original_gate = engine._emit_session_gate
+
+    def invalidate_record_after_hook(*args, **kwargs):
+        result = original_gate(*args, **kwargs)
+        task.worktree_identity = (0, 0)
+        return result
+
+    monkeypatch.setattr(engine, "_emit_session_gate", invalidate_record_after_hook)
+    refusal = None
+    try:
+        engine._fix_phase(task, "verification needs repair")
+    except Exception as exc:
+        refusal = exc
+
+    assert task.attempt == 1
+    assert task.sessions == [prior]
+    assert adapter.sessions == []
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+    assert engine._dev_attempt_dispatched(task) is True
+
+
+def test_mounted_review_refusal_restores_only_new_cycle_and_followup_spend(project, monkeypatch):
+    """A refused follow-up keeps its prior review and does not spend either budget.
+
+    Ablation: bypass the post-hook gate and the adapter starts cycle 2, spending a grant.
+    """
+
+    class AdapterReached(Exception):
+        pass
+
+    def adapter_must_not_run(_spec):
+        raise AdapterReached
+
+    engine, adapter, unit, task = _mounted_dispatch(
+        project,
+        [wt_review_effect(project, "1-1-a", clean=False), adapter_must_not_run],
+    )
+    spec = unit.workspace.paths.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(spec, "done", rev_parse_head(unit.path))
+    task.phase = Phase.DEV_VERIFY
+    task.spec_file = str(spec)
+    task.review_cycle = 0
+    task.followup_review_recommended = True
+    original_gate = engine._emit_session_gate
+    review_hooks = 0
+
+    def invalidate_after_second_review_hook(*args, **kwargs):
+        nonlocal review_hooks
+        result = original_gate(*args, **kwargs)
+        if args[1] == "review":
+            review_hooks += 1
+            if review_hooks == 2:
+                task.worktree_identity = (0, 0)
+        return result
+
+    monkeypatch.setattr(engine, "_emit_session_gate", invalidate_after_second_review_hook)
+    refusal = None
+    try:
+        engine._review_and_commit(task)
+    except Exception as exc:
+        refusal = exc
+
+    assert review_hooks == 2
+    assert len(adapter.sessions) == 1, "the refused follow-up review started"
+    assert task.review_cycle == 1
+    assert task.followup_reviews_spent == 0
+    assert len(task.sessions) == 1 and task.sessions[0].role == "review"
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_mounted_dev_dispatch_refuses_mount_swap_after_pre_session_hook(
+    project, tmp_path, monkeypatch
+):
+    """A mount swapped by the pre-session hook is refused before adapter launch.
+
+    Ablation: remove the final identity gate after ``_emit_session_gate`` and the
+    mock adapter is reached with a charged dev attempt.
+    """
+
+    class AdapterReached(Exception):
+        pass
+
+    def adapter_must_not_run(_spec):
+        raise AdapterReached
+
+    engine, adapter, unit, task = _mounted_dispatch(project, [adapter_must_not_run])
+    recorded = task.worktree_identity
+    original_gate = engine._emit_session_gate
+    swapped = False
+
+    def swap_after_hook(*args, **kwargs):
+        nonlocal swapped
+        result = original_gate(*args, **kwargs)
+        if args[1] == "dev" and not swapped:
+            replacement = tmp_path / "replacement-mount"
+            shutil.copytree(unit.path, replacement, symlinks=True)
+            aside = unit.path.with_name(f"{unit.path.name}-aside")
+            unit.path.rename(aside)
+            unit.path.symlink_to(replacement, target_is_directory=True)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(engine, "_emit_session_gate", swap_after_hook)
+    refusal = None
+    try:
+        engine._dev_phase(task)
+    except Exception as exc:
+        refusal = exc
+
+    assert swapped
+    assert adapter.sessions == [], "the adapter started after the hook replaced the mount"
+    assert task.attempt == 0, "the refused session spent a dev attempt"
+    assert task.worktree_identity == recorded
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+    assert engine._dev_attempt_dispatched(task) is False
+
+    engine._finish_inflight()
+    assert adapter.sessions == [], "terminal escalation replayed the refused session"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_mounted_dev_dispatch_stops_hooks_after_role_hook_replaces_mount(
+    project, tmp_path, monkeypatch
+):
+    """A role hook that replaces the mount prevents the generic hook from running.
+
+    Ablation: remove the identity check between session hooks and ``pre_session`` runs.
+    """
+
+    class AdapterReached(Exception):
+        pass
+
+    def adapter_must_not_run(_spec):
+        raise AdapterReached
+
+    engine, adapter, unit, task = _mounted_dispatch(project, [adapter_must_not_run])
+    hooks: list[str] = []
+    aside = unit.path.with_name(f"{unit.path.name}-aside")
+    monkeypatch.setattr(
+        engine._bus, "active", lambda stage: stage in ("pre_dev_session", "pre_session")
+    )
+
+    def run_hook(stage, _ctx):
+        hooks.append(stage)
+        if stage == "pre_dev_session":
+            replacement = tmp_path / "replacement-mount"
+            shutil.copytree(unit.path, replacement, symlinks=True)
+            unit.path.rename(aside)
+            unit.path.symlink_to(replacement, target_is_directory=True)
+        return True
+
+    monkeypatch.setattr(engine, "_bus_emit", run_hook)
+    refusal = None
+    try:
+        engine._dev_phase(task)
+    except Exception as exc:
+        refusal = exc
+
+    assert hooks == ["pre_dev_session"]
+    assert task.attempt == 0
+    assert adapter.sessions == []
+    assert isinstance(refusal, RunPaused) and "worktree identity" in str(refusal)
+    assert task.phase == Phase.ESCALATED
+    assert aside.is_dir()
 
 
 def test_nested_reopen_reanchors_on_the_mount_project(project):

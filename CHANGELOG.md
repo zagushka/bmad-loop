@@ -203,6 +203,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Refuse model dispatch when a worktree no longer matches its recorded identity.
+
 - Reject symlinked or non-local Codex hook configurations before checking trust.
 
 - Accept fresh v7 workflow-body renders, carry declared module and hub dependencies,
