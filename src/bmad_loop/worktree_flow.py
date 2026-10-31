@@ -2068,8 +2068,8 @@ class WorktreeFlow:
         ``worktree`` (DW-341).
 
         Provisioning writes a fresh ``.codex/hooks.json`` per worktree path, and
-        Codex silently skips hooks without a trust grant for that path — the
-        session's Stop would never arrive. The path queried is the mount PROJECT,
+        Codex silently skips untrusted hooks — the session's Stop would never
+        arrive. The path queried is the mount PROJECT,
         where both the hook config and the session cwd sit (DW-484): ``worktree``
         itself by default, ``<worktree>/<offset>`` under a nested ``repo_root``,
         where the mount root holds no hook config. So each Codex-dialect adapter among
@@ -2086,7 +2086,7 @@ class WorktreeFlow:
         (:data:`codex_trust.QUERY_FAILED_REASON` — spawn error, timeout) is
         retried exactly once; a real verdict never is. Fail closed — anything but
         ``trusted`` escalates, leaving the worktree mounted at its deterministic
-        path so the operator can grant trust there, re-arm, and resume. Codex's
+        path so the operator can inspect the effective hooks, re-arm, and resume. Codex's
         own trust state is never written. Adapters without a profile (test fakes)
         and non-Codex dialects are skipped; main-checkout sessions never reach here.
         """
@@ -2115,6 +2115,15 @@ class WorktreeFlow:
                 # The query itself failed, not Codex's verdict: one retry absorbs a
                 # transient app-server spawn failure or timeout before escalating.
                 trust = codex_trust.project_hook_trust(mount, queried, binary=binary)
+            if trust.reason.startswith("hook trust: Codex omitted the "):
+                try:
+                    registered = verify.worktree_is_registered(self.paths.repo_root, worktree)
+                except verify.GitError:
+                    registered = False
+                if registered:
+                    trust = codex_trust.project_hook_trust(
+                        mount, queried, binary=binary, source_project=self.paths.project
+                    )
             if trust.status == "trusted":
                 continue
             self.escalate_unit(  # always raises RunPaused
@@ -2143,7 +2152,7 @@ class WorktreeFlow:
                 "Codex hook discovery, make sure the Codex binary is on PATH, and make "
                 "sure the worktree's hook config is readable. "
             )
-        return head + "Open Codex in that worktree, accept its hook trust prompt"
+        return head + "Open Codex in that worktree, inspect /hooks, and trust the required hooks"
 
     def engine_agent_ids(self) -> list[str]:
         """The Unity-MCP `setup-mcp` agent ids for every CLI that runs in a

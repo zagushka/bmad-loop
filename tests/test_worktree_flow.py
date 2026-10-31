@@ -1656,8 +1656,8 @@ def test_codex_trust_gate_skips_fakes_and_non_codex_dialects(tmp_path, monkeypat
 
 
 def test_codex_trust_gate_untrusted_text_names_the_prompt(tmp_path, monkeypatch):
-    """``untrusted`` is cleared by Codex's own prompt: the text says to accept it in
-    that worktree — and none of the ``unverifiable`` fixes, which would send the
+    """``untrusted`` directs the operator to inspect Codex's hooks in the worktree
+    and names none of the ``unverifiable`` fixes, which would send the
     operator the wrong way. The recovery command is NOT in the reason:
     ``escalate_unit`` appends its own resolve/resume suffix to the notification, so
     repeating it here would print it twice."""
@@ -1671,7 +1671,9 @@ def test_codex_trust_gate_untrusted_text_names_the_prompt(tmp_path, monkeypatch)
     reason = excinfo.value.reason
     assert f"Codex hook trust is untrusted for the dev session's worktree {wt}" in reason
     assert "(reason-codex)" in reason
-    assert reason.endswith("Open Codex in that worktree, accept its hook trust prompt")
+    assert reason.endswith(
+        "Open Codex in that worktree, inspect /hooks, and trust the required hooks"
+    )
     assert "bmad-loop resume" not in reason and "resolve" not in reason
     assert "could not verify" not in reason and "extra_args" not in reason
     # The recovery command appears exactly once — from escalate_unit's suffix.
@@ -1702,7 +1704,9 @@ def test_codex_trust_gate_unverifiable_text_names_the_likely_fixes(tmp_path, mon
     assert "Codex binary is on PATH" in reason and "hook config is readable" in reason
     fixes, prompt = reason.index("Likely fixes"), reason.index("Open Codex in that worktree")
     assert fixes < prompt
-    assert reason.endswith("Open Codex in that worktree, accept its hook trust prompt")
+    assert reason.endswith(
+        "Open Codex in that worktree, inspect /hooks, and trust the required hooks"
+    )
     assert "bmad-loop resume" not in reason and "resolve" not in reason
 
 

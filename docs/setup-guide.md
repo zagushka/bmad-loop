@@ -450,13 +450,13 @@ Codex trusts hooks per directory, and an untrusted hook never fires, so a sessio
    - `untrusted`, the relay is not usable or Codex omitted it: re-register it with `bmad-loop init --cli codex`.
    - `unverifiable`: fix the cause it names, for example stage `extra_args` other than `--dangerously-bypass-approvals-and-sandbox` or the sandboxed permission args (`--sandbox workspace-write`, `--ask-for-approval never`, and `-c` overrides of `default_permissions` or `permissions.*`), profile `launch_args`, Codex missing from `PATH`, or an unreadable `.codex/hooks.json`. Then check again.
 
-Under `[scm] isolation = "worktree"`, every unit runs in a new worktree that Codex has not trusted yet. `validate` therefore always fails `hooks.trust` under worktree isolation; that failure is expected, and `probe-adapter codex` still reports the project checkout. The run checks trust itself before each Codex session in a worktree. When a check fails, the unit escalates and the run pauses. For each such pause:
+Under `[scm] isolation = "worktree"`, `validate` cannot verify the future worktree and therefore fails `hooks.trust`; `probe-adapter codex` still reports the project checkout. Before each Codex worktree session, the run checks the hooks Codex reports for that worktree. If Codex reports the main project's hooks, the run accepts them only for a registered linked worktree with an identical hook configuration and trusted, enabled relays. When a check fails, the unit escalates and the run pauses. For each such pause:
 
 1. Read the escalation. It names the role, the worktree path, the status and the reason. For `unverifiable`, fix the cause first.
-2. `cd` into the named worktree (it stays mounted under `.bmad-loop/runs/<run-id>/worktrees/`), run `codex`, and accept the hook trust prompt.
+2. `cd` into the named worktree (it stays mounted under `.bmad-loop/runs/<run-id>/worktrees/`), run `codex`, and use `/hooks` to inspect which hooks and source Codex loaded. Trust the required hooks if Codex prompts you. If it loads the main project's hooks, check that both hook configuration files match and the main project's hooks are trusted.
 3. `bmad-loop resolve <run-id> --no-interactive` and answer yes: it re-arms the story and resumes the run. (With `--no-resume`, run `bmad-loop resume <run-id>` afterwards.)
 
-Expect one pause per unit: each worktree path needs its own grant. The re-armed story restarts from its baseline. bmad-loop never writes Codex's trust state itself.
+The re-armed story restarts from its baseline. bmad-loop never writes Codex's trust state itself.
 
 #### Codex shared app-server daemon
 

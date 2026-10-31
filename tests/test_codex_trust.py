@@ -70,6 +70,36 @@ def test_trust_ignores_unrelated_command_containing_bmad_loop(tmp_path, monkeypa
     assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "trusted"
 
 
+@pytest.mark.parametrize(
+    "scenario", ["trusted", "different", "untrusted", "disabled", "foreign", "symlink"]
+)
+def test_effective_source_requires_matching_config_and_trusted_relays(
+    tmp_path, monkeypatch, scenario
+):
+    mount, source = tmp_path / "mount", tmp_path / "source"
+    mount.mkdir()
+    source.mkdir()
+    data = _config(mount)
+    source_path = source / ".codex/hooks.json"
+    source_path.parent.mkdir()
+    source_path.write_bytes((mount / ".codex/hooks.json").read_bytes())
+    reply = _rpc(source, data, "untrusted" if scenario == "untrusted" else "trusted")
+    reply["data"][0]["cwd"] = str(mount.resolve())
+    if scenario == "different":
+        source_path.write_text("{}")
+    elif scenario == "disabled":
+        reply["data"][0]["hooks"][1]["enabled"] = False
+    elif scenario == "foreign":
+        reply["data"][0]["hooks"][1]["sourcePath"] = str(tmp_path / "other/hooks.json")
+    elif scenario == "symlink":
+        source_path.unlink()
+        source_path.symlink_to(mount / ".codex/hooks.json")
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "codex-stub")
+    monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: reply)
+    result = codex_trust.project_hook_trust(mount, get_profile("codex"), source_project=source)
+    assert (result.status == "trusted") == (scenario == "trusted")
+
+
 @pytest.mark.parametrize("linked_directory", [False, True])
 def test_trust_rejects_symlinked_project_hook_config(tmp_path, monkeypatch, linked_directory):
     project = tmp_path / "project"

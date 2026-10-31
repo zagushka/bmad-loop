@@ -1728,7 +1728,7 @@ def test_codex_worktree_without_hook_trust_escalates_before_any_session(
     assert "Codex hook trust" in reason and status in reason
     assert task.worktree_path and task.worktree_path in reason
     assert "hook trust is stale for Stop" in reason
-    assert "Open Codex in that worktree, accept its hook trust prompt" in reason
+    assert "Open Codex in that worktree, inspect /hooks" in reason
     # The recovery command comes only from escalate_unit's own suffix: once.
     assert "bmad-loop resume" not in reason and "resolve" not in reason
     attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
@@ -1737,6 +1737,35 @@ def test_codex_worktree_without_hook_trust_escalates_before_any_session(
     assert Path(task.worktree_path).is_dir()  # kept for the operator to trust
     kinds = journal_kinds(engine)
     assert kinds.index("worktree-opened") < kinds.index("story-escalated")
+
+
+@pytest.mark.parametrize("registered", [True, False])
+def test_parent_hook_source_requires_registered_worktree(project, monkeypatch, registered):
+    from bmad_loop.adapters.profile import get_profile
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    monkeypatch.setattr(adapter, "profile", get_profile("codex"), raising=False)
+    calls = []
+
+    def trust(path, profile, **kwargs):
+        calls.append(kwargs.get("source_project"))
+        if kwargs.get("source_project"):
+            return worktree_flow.codex_trust.TrustResult("trusted", "fixture")
+        return worktree_flow.codex_trust.TrustResult(
+            "untrusted", "hook trust: Codex omitted the Stop relay"
+        )
+
+    monkeypatch.setattr(worktree_flow.codex_trust, "project_hook_trust", trust)
+    monkeypatch.setattr(worktree_flow.verify, "worktree_is_registered", lambda *_: registered)
+    summary = engine.run()
+    assert (not summary.paused) == registered
+    assert bool(adapter.sessions) == registered
+    assert None in calls
+    assert (project.project in calls) == registered
 
 
 def test_codex_worktree_with_hook_trust_queries_worktree_and_launch_binary(project, monkeypatch):

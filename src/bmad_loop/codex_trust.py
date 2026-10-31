@@ -259,6 +259,7 @@ def project_hook_trust(
     *,
     binary: str | None = None,
     marker: str = _RELAY_MARKER,
+    source_project: Path | None = None,
 ) -> TrustResult:
     """Fail closed unless Codex reports every required configured hook trusted."""
     if profile.hooks.dialect != "codex-hooks-json":
@@ -281,9 +282,23 @@ def project_hook_trust(
     except (OSError, RuntimeError, ValueError):
         return TrustResult("unverifiable", "hook trust config path is invalid")
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config_bytes = config_path.read_bytes()
+        config = json.loads(config_bytes)
     except (OSError, UnicodeError, ValueError):
         return TrustResult("unverifiable", "hook trust config is unreadable")
+    if source_project is not None:
+        try:
+            source_root = source_project.resolve(strict=True)
+            source_path = source_root / profile.hooks.config_path
+            if (
+                not source_path.is_relative_to(source_root)
+                or source_path.resolve(strict=True) != source_path
+                or source_path.read_bytes() != config_bytes
+            ):
+                return TrustResult("unverifiable", "hook trust source differs from worktree config")
+            config_path = source_path
+        except (OSError, RuntimeError, ValueError):
+            return TrustResult("unverifiable", "hook trust source is invalid")
     try:
         commands = _commands(config, profile, project, marker)
     except ProfileError as e:
