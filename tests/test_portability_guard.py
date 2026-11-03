@@ -265,6 +265,7 @@ SAVE_STATE_CALLERS = {
     ("runs.py", "_rearm_escalation_locked"),
     ("runs.py", "_rearm_for_reverify_locked"),
     ("runs.py", "adopt_escalated_branch"),
+    ("runs.py", "continue_review"),
     ("runs.py", "restamp_code_root"),
     ("runs.py", "_stop_run_once"),
     ("runsetup.py", "compose_run"),
@@ -291,6 +292,7 @@ RUN_STATE_TRANSACTIONS = {
     ("runs.py", "rearm_escalation"),
     ("runs.py", "rearm_for_reverify"),
     ("runs.py", "adopt_escalated_branch"),
+    ("runs.py", "continue_review"),
     ("runs.py", "restamp_code_root"),
     ("runs.py", "_stop_run_once"),
     ("runs.py", "archive_run"),
@@ -1489,6 +1491,9 @@ JOURNAL_KINDS = frozenset(
         # DW-522. A DEFERRED or environment-fault ESCALATED story re-armed for a
         # verify replay of its kept tree, from `runs._rearm_for_reverify_locked`.
         "story-reverify-armed",
+        # Review-only continuation records carry the already-routed `story_key`.
+        "review-continuation-armed",
+        "resume-review-continuation",
         # DW-522. The engine's `_finish_inflight` reverify arm entering the replay
         # (`resume-reverify`), and the replay's `decide_reverify` routing
         # (`reverify-decision`), from `Engine._resume_reverify`.
