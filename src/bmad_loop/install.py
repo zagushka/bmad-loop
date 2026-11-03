@@ -819,7 +819,9 @@ def _initiative_children(folder: Path) -> tuple[tuple[str, ...] | None, Path, st
         return None, path, "`initiative` is not a list of `[[initiative]]` tables"
     children: list[str] = []
     for row in rows:  # pyright: ignore[reportUnknownVariableType]
-        slug = row.get("slug") if isinstance(row, dict) else None  # pyright: ignore[reportUnknownMemberType]
+        slug = (
+            row.get("slug") if isinstance(row, dict) else None
+        )  # pyright: ignore[reportUnknownMemberType]
         if not isinstance(slug, str):
             return None, path, "an `[[initiative]]` table has no text `slug`"
         children.append(slug)

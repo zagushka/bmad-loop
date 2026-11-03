@@ -213,6 +213,7 @@ def test_v7_project_cannot_fall_back_to_v7_for_legacy_queue(project):
 
 def test_runtime_guard_wraps_session_before_and_after_and_stops_tampering(tmp_path, monkeypatch):
     from types import SimpleNamespace
+
     from bmad_loop.engine import Engine
     from bmad_loop.model import StoryTask
 
