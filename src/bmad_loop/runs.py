@@ -6463,10 +6463,10 @@ def review_continuation_refusal(
 ) -> str | None:
     """Refuse review-only continuation unless the paused task still owns a verified candidate.
 
-    This intentionally supports only in-place story runs. It accepts either an
-    incomplete native review after an accepted dev result, or the explicit first
-    review of a blocked ticket candidate whose result and plan are both recorded;
-    no prose or failure reason can opt a task in.
+    This intentionally supports only in-place story runs. It accepts an
+    incomplete native review after an accepted dev result, or an explicitly
+    selected blocked ticket review whose result and plan are both recorded; no
+    prose or failure reason can opt a task in.
     """
     hint = f"re-arm it with `bmad-loop resolve {state.run_id}` instead"
     if state.run_type == "sweep":
@@ -6524,12 +6524,39 @@ def review_continuation_refusal(
         if primary[-1][1].role != "review":
             return f"story {story_key}'s latest primary session is not a review"
         review = primary[-1][1]
-        if review.status not in REVIEW_TIMEOUT_STATUSES:
+        if task.accepted_dev_session_index != dev_index:
+            return f"story {story_key} has no accepted implementation candidate"
+        completed_blocked_review = (
+            state.source == worksource.SOURCE_TICKETS
+            and review.status == "completed"
+            and review.result_json is not None
+            and review.result_json.get("status") == "blocked"
+        )
+        if completed_blocked_review:
+            plan_path = Path(task.spec_file).resolve()
+            for label, result in (("dev", dev.result_json), ("review", review.result_json)):
+                if (
+                    result is None
+                    or not result.get("spec_file")
+                    or Path(str(result["spec_file"])).resolve() != plan_path
+                ):
+                    return f"story {story_key}'s {label} result does not bind its recorded plan"
+            if dev.result_json.get("status") not in {"blocked", "built"}:
+                return f"story {story_key} has no accepted blocked or built dev candidate"
+            try:
+                fields = parse_frontmatter(plan_path.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeDecodeError, ValueError) as e:
+                return f"cannot read story {story_key}'s blocked review plan ({e})"
+            if (
+                fields.get("status") not in {"blocked", "in-review"}
+                or fields.get("route") != "full"
+                or fields.get("review") != "thorough"
+            ):
+                return f"story {story_key}'s blocked review is not bound to a full thorough plan"
+        elif review.status not in REVIEW_TIMEOUT_STATUSES:
             return (
                 f"story {story_key}'s latest review is not an incomplete review ({review.status})"
             )
-        if task.accepted_dev_session_index != dev_index:
-            return f"story {story_key} has no accepted implementation candidate"
     try:
         paths = bmadconfig.load_paths(project_root)
         if str(paths.repo_root) != str(state.code_root):
@@ -6557,9 +6584,16 @@ def review_continuation_source_identity(
     except ValueError:
         plan_rel = None
     fields = parse_frontmatter(plan.read_text(encoding="utf-8-sig"))
-    normalize_ticket_status = task.review_cycle == 0
-    if normalize_ticket_status and status_of(fields) not in {"blocked", "in-review"}:
-        raise ValueError("bound ticket plan status is outside the review-continuation transition")
+    ticket_status = status_of(fields)
+    normalize_ticket_status = state.source == worksource.SOURCE_TICKETS and ticket_status in {
+        "blocked",
+        "in-review",
+    }
+    if task.review_cycle == 0 and state.source == worksource.SOURCE_TICKETS:
+        if ticket_status not in {"blocked", "in-review"}:
+            raise ValueError(
+                "bound ticket plan status is outside the review-continuation transition"
+            )
 
     digest = hashlib.sha256()
     digest.update(b"bmad-review-continuation-v1\0")

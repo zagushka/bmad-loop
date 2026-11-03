@@ -1275,7 +1275,22 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         ) + (f" {tail}" if tail else "")
 
     def _prepare_review_continuation(self, task: StoryTask) -> bool:
-        """Route the operator-approved blocked candidate to ticket review via mark."""
+        """Route a blocked ticket plan to review; retain other eligible plans."""
+        plan = self._bound_plan(task)
+        if plan is None:
+            self._escalate(task, f"review continuation has no bound plan for {task.story_key}")
+            return False
+        try:
+            state = _plan_state(plan)
+        except (OSError, UnicodeDecodeError) as e:
+            self._escalate(task, f"review continuation cannot read its plan: {e}")
+            return False
+        if state is None:
+            self._escalate(task, f"review continuation plan is absent: {plan}")
+            return False
+        status, _, _ = state
+        if status not in {"blocked", "in-review"}:
+            return True
         try:
             self._route_plan(task, "in-review")
         except OwnedPlanRefused as e:
@@ -1555,7 +1570,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             # every dispatched row has an id: backlog rows (no id) never dispatch
             ticket_id=ticket.id or ticket.ref,
             plan_halt=plan_halt,
-            review_continuation=(task.review_continuation_pending and task.review_cycle == 0),
+            review_continuation=task.review_continuation_pending,
             operator_park=self._operator_park_enabled(),
             engine_written=self._harvest_gate_exclude(task),
         )

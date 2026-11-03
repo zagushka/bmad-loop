@@ -452,8 +452,8 @@ class StoryTask:
     # over an unreadable ledger. Resume retries that current review's salvage,
     # including authoritative verification, instead of rebuilding the attempt.
     salvage_refile_pending: bool = False
-    # An operator explicitly continued an incomplete review without re-arming the
-    # implementation attempt. Consumed by Engine._finish_inflight before restart.
+    # An operator explicitly continued review on the selected retained candidate
+    # without re-arming the implementation attempt. Consumed by Engine._finish_inflight.
     review_continuation_pending: bool = False
     # SHA-256 identity of the retained source the operator selected when arming a
     # review-only continuation. The bound plan's status fields are the only edits

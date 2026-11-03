@@ -7517,7 +7517,7 @@ class Engine:
             verification_sequence=verified.sequence,
         )
         if origin == "incomplete-review" and outcome.ok:
-            if task.review_cycle == 0 and not self._prepare_review_continuation(task):
+            if not self._prepare_review_continuation(task):
                 task.reverify_from = ""
                 task.review_continuation_pending = False
                 task.reverify_replayed = ""

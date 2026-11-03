@@ -10671,16 +10671,32 @@ def test_rearm_for_reverify_moves_deferred_to_dev_verify_keeping_baseline(tmp_pa
 
 
 def test_review_continuation_refuses_a_completed_review_before_mutation(tmp_path):
-    """Ablation: removing the incomplete-review status gate lets the mutation through."""
+    """Ablation: removing the completed-review eligibility gate admits this review."""
     from bmad_loop.model import PAUSE_ESCALATION, SessionRecord
 
     run_dir, spec_path = _reverify_run(tmp_path, phase="escalated")
+    spec_path.write_text(
+        "---\nstatus: blocked\nroute: full\nreview: thorough\n---\n\nplan\n",
+        encoding="utf-8",
+    )
     state = load_state(run_dir)
+    state.source = "tickets"
     task = state.tasks[_REVERIFY_KEY]
     task.salvage_refile_pending = False
     task.accepted_dev_session_index = 0
+    task.spec_file = str(spec_path.resolve())
+    task.sessions[0].result_json = {
+        "status": "blocked",
+        "spec_file": str(spec_path.resolve()),
+        "plan_halt": False,
+    }
     task.sessions.append(
-        SessionRecord(task_id="review-complete", role="review", status="completed")
+        SessionRecord(
+            task_id="review-complete",
+            role="review",
+            status="completed",
+            result_json={"status": "built", "spec_file": str(spec_path.resolve())},
+        )
     )
     state.paused_stage = PAUSE_ESCALATION
     save_state(run_dir, state)

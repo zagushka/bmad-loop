@@ -1669,6 +1669,231 @@ def test_review_continuation_verifies_blocked_ticket_then_dispatches_review(
     assert finished.accepted_dev_session_index == 0
 
 
+@pytest.mark.parametrize("change_after_approval", [False, True])
+def test_cycle_one_blocked_review_continuation_is_review_only_and_gated(
+    project_v7, monkeypatch, change_after_approval
+):
+    """A completed blocked review can continue on its pinned full/thorough ticket.
+
+    This uses the observed first-review result shape: the completed dev record is
+    blocked with a CRITICAL escalation, and a completed blocked review is the last
+    primary session. Verification uses the real artifact and configured-command
+    gates; the ticket plan is marked through TicketTree.mark.
+    """
+    blocked_at = "2026-11-03T10:00:00Z"
+    blocked_reason = "nested thorough review incomplete"
+    tree = _tree(
+        project_v7,
+        blocked=(
+            ticket_row(
+                "1.1", status="blocked", blocked_at=blocked_at, blocked_reason=blocked_reason
+            ),
+        ),
+    )
+    policy = Policy(
+        gates=GatesPolicy(mode="per-story-spec-approval"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="recommended"),
+        verify=VerifyPolicy(commands=("git diff --check",)),
+    )
+    engine, _ = make_engine(project_v7, tree, policy=policy, source="tickets")
+    task = _bound(engine, tree)
+    baseline = verify.rev_parse_head(project_v7.project)
+    plan = write_plan(
+        project_v7,
+        "epic-cart",
+        "story-cart-model-plan",
+        1,
+        "blocked",
+        blocked_reason=blocked_reason,
+        blocked_at=blocked_at,
+        route="full",
+        review="thorough",
+        baseline_revision=baseline,
+    )
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    task.ticket = ticket_binding(tree.finds["1.1"])
+    (project_v7.project / "src.txt").write_text("retained candidate\n", encoding="utf-8")
+    git(project_v7.project, "add", "src.txt")
+    git(project_v7.project, "commit", "-q", "-m", "retained ticket candidate")
+
+    task.phase = Phase.ESCALATED
+    task.attempt = 1
+    task.review_cycle = 1
+    task.baseline_commit = baseline
+    task.spec_file = str(plan.resolve())
+    task.salvage_refile_pending = False
+    task.accepted_dev_session_index = 0
+    task.followup_review_recommended = False
+    task.sessions.extend(
+        [
+            SessionRecord(
+                task_id="1.1-dev-1",
+                role="dev",
+                status="completed",
+                result_json={
+                    "workflow": "auto-dev",
+                    "status": "blocked",
+                    "spec_file": str(plan.resolve()),
+                    "followup_review_recommended": False,
+                    "escalations": [
+                        {
+                            "type": "blocked",
+                            "severity": "CRITICAL",
+                            "detail": "review incomplete",
+                            "spec_file": str(plan.resolve()),
+                        }
+                    ],
+                    "park_asserted": False,
+                    "artifact_only": False,
+                },
+            ),
+            SessionRecord(
+                task_id="1.1-review-1",
+                role="review",
+                status="completed",
+                result_json={
+                    "workflow": "auto-dev",
+                    "status": "blocked",
+                    "spec_file": str(plan.resolve()),
+                },
+            ),
+        ]
+    )
+    engine.state.paused_stage = PAUSE_ESCALATION
+    engine.state.paused_story_key = task.story_key
+    save_state(engine.run_dir, engine.state)
+    runs.continue_review(engine.run_dir, task.story_key, project_root=project_v7.project)
+
+    native_tree = TicketTree(project_v7.project, pinned_initiative=project_v7.initiative)
+    real_mark = native_tree.mark
+    native_marks = []
+
+    def mark(ref, target, **kw):
+        result = real_mark(ref, target, **kw)
+        native_marks.append((result.after, kw["reason"], result.outcome))
+        if result.outcome == "written":
+            tree.finds["1.1"] = dataclasses.replace(
+                tree.finds["1.1"], row=ticket_row("1.1", status=target)
+            )
+        return result
+
+    monkeypatch.setattr(tree, "mark", mark)
+
+    def review(spec: SessionSpec) -> SessionResult:
+        current = Path(spec.cwd) / plan.relative_to(project_v7.project)
+        assert status_of(parse_frontmatter(current.read_text(encoding="utf-8"))) == "in-review"
+        current.write_text(
+            current.read_text(encoding="utf-8").replace("status: in-review", "status: built"),
+            encoding="utf-8",
+        )
+        tree.finds["1.1"] = dataclasses.replace(
+            tree.finds["1.1"], row=ticket_row("1.1", status="built")
+        )
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "status": "built",
+                "spec_file": str(current),
+                "followup_review_recommended": False,
+            },
+        )
+
+    first = TicketsEngine(
+        paths=engine.paths,
+        policy=policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=load_state(engine.run_dir),
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+    first_summary = first.run()
+    assert first_summary.paused and "spec approval" in first_summary.paused_reason
+    paused_state = load_state(engine.run_dir)
+    paused_task = paused_state.tasks["1.1"]
+    assert paused_state.paused_stage == "spec-approval"
+    assert (
+        paused_task.phase == Phase.DEV_VERIFY
+        and paused_task.reverify_from == ""
+        and paused_task.reverify_replayed == "incomplete-review"
+        and paused_task.review_continuation_pending
+    )
+    assert (
+        paused_task.accepted_dev_session_index == 0
+        and paused_task.attempt == 1
+        and paused_task.generation == 0
+        and paused_task.review_cycle == 1
+    )
+    assert _plan_status(plan) == "in-review"
+    frontmatter = parse_frontmatter(plan.read_text(encoding="utf-8"))
+    assert not frontmatter.get("blocked_reason") and not frontmatter.get("blocked_at")
+    assert native_marks == [("in-review", "rearm", "written")]
+    dev_verify_rows = [
+        row for row in _kinds(first, "verify-command-result") if row["verification_stage"] == "dev"
+    ]
+    assert len(dev_verify_rows) == 1 and dev_verify_rows[0]["returncode"] == 0
+
+    paused_state.clear_pause()  # match the normal CLI resume path
+    if change_after_approval:
+        (project_v7.project / "src.txt").write_text(
+            "changed after spec approval\n", encoding="utf-8"
+        )
+    save_state(engine.run_dir, paused_state)
+    before = (paused_task.attempt, paused_task.generation, paused_task.review_cycle)
+    resumed_adapter = MockAdapter([review])
+    resumed = TicketsEngine(
+        paths=engine.paths,
+        policy=policy,
+        adapter=resumed_adapter,
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=load_state(engine.run_dir),
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+    review_calls = []
+    review_and_commit = resumed._review_and_commit
+
+    def record_review_dispatch(task, *args, **kwargs):
+        review_calls.append(task.story_key)
+        return review_and_commit(task, *args, **kwargs)
+
+    monkeypatch.setattr(resumed, "_review_and_commit", record_review_dispatch)
+    summary = resumed.run()
+
+    if change_after_approval:
+        assert (
+            summary.paused
+            and "changed after review continuation was armed" in summary.paused_reason
+        )
+        assert review_calls == []
+        assert resumed_adapter.sessions == []
+        refused = load_state(engine.run_dir).tasks["1.1"]
+        assert refused.phase == Phase.ESCALATED
+        assert (refused.attempt, refused.generation, refused.review_cycle) == before
+        assert native_marks == [("in-review", "rearm", "written")]
+        return
+
+    assert summary.done == 1 and not summary.paused
+    assert [session.role for session in resumed_adapter.sessions] == ["review"]
+    assert review_calls == ["1.1"]
+    assert native_marks == [
+        ("in-review", "rearm", "written"),
+        ("done", "accept", "written"),
+    ]
+    all_dev_verifies = [
+        row
+        for row in _kinds(resumed, "verify-command-result")
+        if row["verification_stage"] == "dev"
+    ]
+    assert len(all_dev_verifies) == 1 and all_dev_verifies[0]["returncode"] == 0
+    finished = load_state(engine.run_dir).tasks["1.1"]
+    assert finished.phase == Phase.DONE and finished.review_cycle == 2
+    assert (finished.attempt, finished.generation) == before[:2]
+    assert finished.accepted_dev_session_index == 0
+
+
 def test_review_converges_on_a_built_plan(project_v7, monkeypatch):
     """A tickets review finishes its plan at `built`, and that converges: one
     review pass, then the verify gate, the mark-done and the unit commit — no

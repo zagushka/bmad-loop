@@ -389,6 +389,8 @@ breaking changes may land in a minor release.
   and the escalations and tickets guides give the post-confirm review procedure. A park
   still never runs the review (#888).
 
+- Allow review-only continuation of an operator-selected blocked full/thorough ticket after a completed blocked review, while retaining candidate verification and cycle limits.
+
 ### Security
 
 - Trust plugins by origin and pin project plugins by content (#496, #497). A project

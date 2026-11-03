@@ -9395,9 +9395,9 @@ def verify_dev_tickets(
       skips proof-of-work as :func:`verify_dev_stories` does. ``awaiting-operator``
       when ``operator_park`` is on and the plan declares it, held to the same
       actions gate and park-assertion waiver as :func:`verify_dev`.
-      ``blocked`` is accepted only on the explicit review-continuation leg, which
-      requires the completed result to say ``blocked`` too and keeps the same
-      baseline and proof-of-work gates.
+      ``blocked`` and cycle-one ``built`` results are accepted only on the explicit
+      review-continuation leg with a compatible bound plan. The baseline and
+      proof-of-work gates still run.
     - A ``dropped`` plan escalates as a contradiction: a human withdrew the ticket
       while its session ran, and no retry can build a dropped ticket.
 
@@ -9448,9 +9448,17 @@ def verify_dev_tickets(
             return VerifyOutcome.retry(
                 "plan_halt results cannot use review-continuation verification"
             )
-        if rj.get("status") != "blocked" or status not in {"blocked", "in-review"}:
+        result_status = rj.get("status")
+        allowed_plan_statuses = {
+            "blocked": {"blocked", "in-review"},
+            "built": {"built", "blocked", "in-review"},
+        }
+        if task.review_cycle == 0:
+            allowed_plan_statuses = {"blocked": {"blocked", "in-review"}}
+        if status not in allowed_plan_statuses.get(result_status, set()):
             return VerifyOutcome.retry(
-                "review-continuation verification requires a blocked result and blocked or in-review plan"
+                "review-continuation verification requires a bound blocked or built result "
+                "and a compatible built, blocked or in-review plan"
             )
         expected = status
     elif plan_halt:

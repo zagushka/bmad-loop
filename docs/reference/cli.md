@@ -229,7 +229,7 @@ bmad-loop resolve [--project PROJECT] [--story STORY] [--no-interactive]
 | `--restore-patch PATH`     | Re-arm the spec to `in-review` and re-apply this saved patch, so review resumes on the attempted change.                                     |
 | `--adopt-branch`           | Commit and merge the kept worktree branch as-is and mark the story done. Worktree isolation only; not for sweeps.                            |
 | `--reverify`               | Keep a DEFERRED (or environment-fault ESCALATED) story's attempt, replay `[verify]`, then review and commit. No dev session; not for sweeps. |
-| `--continue-review`        | Continue review on the operator-selected retained in-place candidate. Preserves attempt and usage counters; no dev session. Refuses unsupported or changed candidates. |
+| `--continue-review`        | Continue review on the operator-selected retained in-place candidate, including a blocked full/thorough ticket after a completed blocked review. Preserves attempt and usage counters; no dev session. Refuses completed built reviews and changed candidates. |
 | `--abandon`                | Close an escalated replay run unmerged: park dirty work on a preserve ref, remove the worktree, keep the branch.                             |
 | `--resume` / `--no-resume` | Resume without prompting / only re-arm. Default: prompt, then resume. Not with `--abandon` (exit 2).                                         |
 | `--force`                  | Proceed when engine liveness cannot be verified. A provably live engine still blocks.                                                        |
