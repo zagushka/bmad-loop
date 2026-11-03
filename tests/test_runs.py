@@ -10820,6 +10820,67 @@ def test_review_continuation_admits_explicit_blocked_ticket_candidate_without_re
     assert source_refusal and "changed after review continuation was armed" in source_refusal
 
 
+@pytest.mark.parametrize(
+    ("owner", "replayed", "dev_status", "bind_review_plan"),
+    [
+        (None, "", "built", True),
+        (1, "deferred", "built", True),
+        (None, "deferred", "blocked", True),
+        (None, "deferred", "built", False),
+        (None, "deferred", None, True),
+        (None, [], "built", True),
+    ],
+)
+def test_review_continuation_refuses_unproven_legacy_owner(
+    tmp_path, owner, replayed, dev_status, bind_review_plan
+):
+    from bmad_loop.model import PAUSE_ESCALATION, SessionRecord
+
+    run_dir, spec_path = _reverify_run(tmp_path, phase="escalated")
+    spec_path.write_text(
+        "---\nstatus: blocked\nroute: full\nreview: thorough\n---\n\nplan\n",
+        encoding="utf-8",
+    )
+    state = load_state(run_dir)
+    state.source = "tickets"
+    state.paused_stage = PAUSE_ESCALATION
+    task = state.tasks[_REVERIFY_KEY]
+    task.review_cycle = 1
+    task.salvage_refile_pending = False
+    task.accepted_dev_session_index = owner
+    task.reverify_replayed = replayed
+    task.spec_file = str(spec_path.resolve())
+    task.sessions[0].result_json = {
+        "status": dev_status,
+        "spec_file": str(spec_path.resolve()),
+        "plan_halt": False,
+    }
+    task.sessions.append(
+        SessionRecord(
+            task_id="review-blocked",
+            role="review",
+            status="completed",
+            result_json={
+                "status": "blocked",
+                "spec_file": (
+                    str(spec_path.resolve())
+                    if bind_review_plan
+                    else str(spec_path.with_name("other.md"))
+                ),
+            },
+        )
+    )
+    save_state(run_dir, state)
+    before = (run_dir / "state.json").read_bytes()
+
+    refusal = runs.review_continuation_refusal(
+        state, task, _REVERIFY_KEY, project_root=spec_path.parents[2]
+    )
+
+    assert refusal
+    assert (run_dir / "state.json").read_bytes() == before
+
+
 def test_rearm_for_reverify_accepts_a_verify_env_fault_escalation(tmp_path):
     from bmad_loop.model import Phase
 

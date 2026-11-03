@@ -2964,9 +2964,13 @@ class Engine:
             return
         self._worktree_flow.bind_publication(task, self.workspace.paths, identity)
 
-    def _accept_current_dev_session(self, task: StoryTask) -> None:
+    def _accept_current_dev_session(
+        self, task: StoryTask, *, session_index: int | None = None
+    ) -> None:
         """Latch the current dev or repair record as the accepted tree owner."""
-        accepted_index = self._current_dev_session_index(task)
+        accepted_index = (
+            self._current_dev_session_index(task) if session_index is None else session_index
+        )
         if accepted_index is None:
             raise RuntimeError(f"accepted dev decision for {task.story_key} has no session record")
         task.accepted_dev_session_index = accepted_index
@@ -7474,9 +7478,10 @@ class Engine:
 
         The latch is cleared in memory BEFORE any decision acts, so the save each
         action makes persists it cleared: a crash mid-defer then replays through
-        the defer arm, never through a second verify replay. The accepted-session
-        latch is deliberately not stamped: the generation the re-arm bumped means
-        no record matches the current attempt, and story runs never read it.
+        the defer arm, never through a second verify replay. A PROCEED stamps the
+        index of the completed dev record whose result supplied this replay before
+        saving the next gate or review state. The generation bump keeps that record's
+        session id unique; ownership remains bound to its append-only session index.
 
         A PROCEED leaves `reverify_replayed` set to the origin in the same save that
         spends the latch (DW-527): a host death mid-review/fix of the continuation then
@@ -7549,8 +7554,15 @@ class Engine:
         task.reverify_from = ""
         if origin == "incomplete-review" and decision.action != Action.PROCEED:
             task.review_continuation_pending = False
-        elif origin == "incomplete-review":
-            self._accept_current_dev_session(task)
+        elif decision.action == Action.PROCEED:
+            # Reverify bumps generation without dispatching dev. Bind the accepted
+            # tree to the native completed dev result that supplied this replay.
+            record_index = next(
+                index
+                for index in range(len(task.sessions) - 1, -1, -1)
+                if task.sessions[index] is record
+            )
+            self._accept_current_dev_session(task, session_index=record_index)
         task.reverify_replayed = origin if decision.action == Action.PROCEED else ""
         if decision.action == Action.PROCEED:
             self._save()

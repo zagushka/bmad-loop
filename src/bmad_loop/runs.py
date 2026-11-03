@@ -6524,14 +6524,19 @@ def review_continuation_refusal(
         if primary[-1][1].role != "review":
             return f"story {story_key}'s latest primary session is not a review"
         review = primary[-1][1]
-        if task.accepted_dev_session_index != dev_index:
-            return f"story {story_key} has no accepted implementation candidate"
         completed_blocked_review = (
             state.source == worksource.SOURCE_TICKETS
             and review.status == "completed"
             and review.result_json is not None
             and review.result_json.get("status") == "blocked"
         )
+        if task.accepted_dev_session_index != dev_index and (
+            task.accepted_dev_session_index is not None
+            or not completed_blocked_review
+            or not isinstance(task.reverify_replayed, str)
+            or task.reverify_replayed not in {"deferred", "escalated"}
+        ):
+            return f"story {story_key} has no accepted implementation candidate"
         if completed_blocked_review:
             plan_path = Path(task.spec_file).resolve()
             for label, result in (("dev", dev.result_json), ("review", review.result_json)):
@@ -6544,6 +6549,8 @@ def review_continuation_refusal(
             dev_status = dev.result_json.get("status")
             if not isinstance(dev_status, str) or dev_status not in {"blocked", "built"}:
                 return f"story {story_key} has no accepted blocked or built dev candidate"
+            if task.accepted_dev_session_index is None and dev_status != "built":
+                return f"story {story_key} has no reverified built implementation candidate"
             try:
                 fields = parse_frontmatter(plan_path.read_text(encoding="utf-8-sig"))
             except (OSError, UnicodeDecodeError, ValueError) as e:

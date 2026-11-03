@@ -19,6 +19,7 @@ from conftest import (
     DEFAULT_TREE,
     FakeTicketTree,
     V7Layout,
+    _file_exists_cmd,
     git,
     ticket_row,
     write_plan,
@@ -48,6 +49,7 @@ from bmad_loop.model import (
 )
 from bmad_loop.policy import (
     GatesPolicy,
+    LimitsPolicy,
     NotifyPolicy,
     OperatorPolicy,
     Policy,
@@ -1692,8 +1694,9 @@ def test_review_continuation_verifies_blocked_ticket_then_dispatches_review(
 
 
 @pytest.mark.parametrize("change_after_approval", [False, True])
+@pytest.mark.parametrize("replay_origin", [None, "deferred", "escalated"])
 def test_cycle_one_blocked_review_continuation_is_review_only_and_gated(
-    project_v7, monkeypatch, change_after_approval
+    project_v7, monkeypatch, change_after_approval, replay_origin
 ):
     """A completed blocked review can continue on its pinned full/thorough ticket.
 
@@ -1702,6 +1705,7 @@ def test_cycle_one_blocked_review_continuation_is_review_only_and_gated(
     primary session. Verification uses the real artifact and configured-command
     gates; the ticket plan is marked through TicketTree.mark.
     """
+    legacy_reverify = replay_origin is not None
     blocked_at = "2026-11-03T10:00:00Z"
     blocked_reason = "nested thorough review incomplete"
     tree = _tree(
@@ -1745,7 +1749,10 @@ def test_cycle_one_blocked_review_continuation_is_review_only_and_gated(
     task.baseline_commit = baseline
     task.spec_file = str(plan.resolve())
     task.salvage_refile_pending = False
-    task.accepted_dev_session_index = 0
+    task.accepted_dev_session_index = None if legacy_reverify else 0
+    task.reverify_replayed = replay_origin or ""
+    if legacy_reverify:
+        task.generation = 1  # reverify keeps the dev record from the prior generation
     task.followup_review_recommended = False
     task.sessions.extend(
         [
@@ -1755,7 +1762,7 @@ def test_cycle_one_blocked_review_continuation_is_review_only_and_gated(
                 status="completed",
                 result_json={
                     "workflow": "auto-dev",
-                    "status": "blocked",
+                    "status": "built" if legacy_reverify else "blocked",
                     "spec_file": str(plan.resolve()),
                     "followup_review_recommended": False,
                     "escalations": [
@@ -1771,7 +1778,7 @@ def test_cycle_one_blocked_review_continuation_is_review_only_and_gated(
                 },
             ),
             SessionRecord(
-                task_id="1.1-review-1",
+                task_id="1.1-review-1-g1" if legacy_reverify else "1.1-review-1",
                 role="review",
                 status="completed",
                 result_json={
@@ -1845,7 +1852,7 @@ def test_cycle_one_blocked_review_continuation_is_review_only_and_gated(
     assert (
         paused_task.accepted_dev_session_index == 0
         and paused_task.attempt == 1
-        and paused_task.generation == 0
+        and paused_task.generation == (1 if legacy_reverify else 0)
         and paused_task.review_cycle == 1
     )
     assert _plan_status(plan) == "in-review"
@@ -1914,6 +1921,263 @@ def test_cycle_one_blocked_review_continuation_is_review_only_and_gated(
     assert finished.phase == Phase.DONE and finished.review_cycle == 2
     assert (finished.attempt, finished.generation) == before[:2]
     assert finished.accepted_dev_session_index == 0
+
+
+def test_reverify_blocked_review_legacy_owner_recovers_through_normal_gates(
+    project_v7, tmp_path, monkeypatch
+):
+    marker = tmp_path / "verify-green"
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = write_plan(
+        project_v7,
+        "epic-cart",
+        "story-cart-model-plan",
+        1,
+        "ready-for-dev",
+        route="full",
+        review="thorough",
+    )
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    git(project_v7.project, "add", plan.relative_to(project_v7.project).as_posix())
+    git(project_v7.project, "commit", "-q", "-m", "record ticket plan fixture")
+
+    def build(spec: SessionSpec) -> SessionResult:
+        current = Path(spec.cwd) / plan.relative_to(project_v7.project)
+        write_plan(
+            project_v7,
+            "epic-cart",
+            "story-cart-model-plan",
+            1,
+            "built",
+            route="full",
+            review="thorough",
+        )
+        (Path(spec.cwd) / "src.txt").write_text("cart model\n", encoding="utf-8")
+        tree.finds["1.1"] = dataclasses.replace(
+            tree.finds["1.1"], row=ticket_row("1.1", status="built")
+        )
+        tree.next_view = _tree(project_v7).next_view
+        return SessionResult(
+            status="completed",
+            result_json={"workflow": "auto-dev", "status": "built", "spec_file": str(current)},
+        )
+
+    blocked_at = "2026-11-03T10:00:00Z"
+    blocked_reason = "nested thorough review incomplete"
+
+    def blocked_review(spec: SessionSpec) -> SessionResult:
+        current = Path(spec.cwd) / plan.relative_to(project_v7.project)
+        write_plan(
+            project_v7,
+            "epic-cart",
+            "story-cart-model-plan",
+            1,
+            "blocked",
+            route="full",
+            review="thorough",
+            blocked_reason=blocked_reason,
+            blocked_at=blocked_at,
+        )
+        tree.finds["1.1"] = dataclasses.replace(
+            tree.finds["1.1"],
+            row=ticket_row(
+                "1.1", status="blocked", blocked_at=blocked_at, blocked_reason=blocked_reason
+            ),
+        )
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "status": "blocked",
+                "spec_file": str(current),
+                "escalations": [
+                    {
+                        "type": "blocked",
+                        "severity": "CRITICAL",
+                        "detail": blocked_reason,
+                        "spec_file": str(current),
+                    }
+                ],
+            },
+        )
+
+    def successful_review(spec: SessionSpec) -> SessionResult:
+        current = Path(spec.cwd) / plan.relative_to(project_v7.project)
+        write_plan(
+            project_v7,
+            "epic-cart",
+            "story-cart-model-plan",
+            1,
+            "built",
+            route="full",
+            review="thorough",
+        )
+        tree.finds["1.1"] = dataclasses.replace(
+            tree.finds["1.1"], row=ticket_row("1.1", status="built")
+        )
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "status": "built",
+                "spec_file": str(current),
+                "followup_review_recommended": False,
+            },
+        )
+
+    policy = Policy(
+        gates=GatesPolicy(mode="per-story-spec-approval"),
+        limits=LimitsPolicy(max_dev_attempts=1),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        scm=ScmPolicy(rollback_on_failure=False),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+    real_mark = tree.mark
+
+    def mark_preserving_plan(ref, target, **kwargs):
+        result = real_mark(ref, target, **kwargs)
+        if result.outcome == "written":
+            lines = plan.read_text(encoding="utf-8-sig").splitlines(keepends=True)
+            in_frontmatter = False
+            updated = []
+            for line in lines:
+                if not in_frontmatter and line.strip() == "---":
+                    in_frontmatter = True
+                    updated.append(line)
+                    continue
+                if in_frontmatter and line.strip() == "---":
+                    in_frontmatter = False
+                    updated.append(line)
+                    continue
+                if in_frontmatter and line.startswith("status:"):
+                    updated.append(f"status: {target}\n")
+                elif in_frontmatter and line.startswith(("blocked_reason:", "blocked_at:")):
+                    continue
+                else:
+                    updated.append(line)
+            plan.write_text("".join(updated), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(tree, "mark", mark_preserving_plan)
+    engine, dev_adapter = make_engine(
+        project_v7, tree, policy=policy, script=[build], source="tickets", max_stories=1
+    )
+    first = engine.run()
+    assert [session.role for session in dev_adapter.sessions] == ["dev"], first.paused_reason
+    deferred = load_state(engine.run_dir)
+    deferred_task = deferred.tasks["1.1"]
+    assert deferred_task.phase == Phase.DEFERRED
+    assert deferred_task.accepted_dev_session_index is None
+
+    marker.touch()
+    runs.rearm_for_reverify(engine.run_dir, project_root=project_v7.project)
+    replay_state = load_state(engine.run_dir)
+    replay_state.clear_pause()
+    save_state(engine.run_dir, replay_state)
+    replay = TicketsEngine(
+        paths=engine.paths,
+        policy=policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=replay_state,
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+    replay_result = replay.run()
+    assert replay_result.paused and "spec approval" in replay_result.paused_reason, [
+        row["reason"] for row in _kinds(replay, "reverify-decision")
+    ]
+    replayed = load_state(engine.run_dir)
+    replayed_task = replayed.tasks["1.1"]
+    assert replayed_task.accepted_dev_session_index == 0
+    assert replayed_task.reverify_replayed == "deferred"
+    assert replayed_task.generation == deferred_task.generation + 1
+    dev_verifies = [
+        row for row in _kinds(replay, "verify-command-result") if row["verification_stage"] == "dev"
+    ]
+    assert [row["returncode"] for row in dev_verifies] == [1, 0]
+
+    # Recreate the historical missing latch after the real successful replay and
+    # its spec-approval pause, leaving the original dev/review evidence untouched.
+    replayed.clear_pause()
+    save_state(engine.run_dir, replayed)
+    approved = TicketsEngine(
+        paths=engine.paths,
+        policy=policy,
+        adapter=MockAdapter([blocked_review]),
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=replayed,
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+    blocked = approved.run()
+    assert blocked.paused and "CRITICAL" in blocked.paused_reason
+    blocked_state = load_state(engine.run_dir)
+    blocked_task = blocked_state.tasks["1.1"]
+    assert blocked_task.phase == Phase.ESCALATED
+    assert blocked_task.accepted_dev_session_index == 0
+    assert blocked_task.reverify_replayed == "deferred"
+    assert [session.role for session in blocked_task.sessions] == ["dev", "review"]
+
+    blocked_task.accepted_dev_session_index = None  # historical missing-marker replay
+    save_state(engine.run_dir, blocked_state)
+    runs.continue_review(engine.run_dir, "1.1", project_root=project_v7.project)
+    armed = load_state(engine.run_dir)
+    assert armed.tasks["1.1"].review_continuation_source_identity
+    assert armed.tasks["1.1"].review_continuation_pending
+    assert armed.tasks["1.1"].phase == Phase.REVIEW_VERIFY
+
+    continued_adapter = MockAdapter([])
+    continued = TicketsEngine(
+        paths=engine.paths,
+        policy=policy,
+        adapter=continued_adapter,
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=armed,
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+    recovered = continued.run()
+    recovered_state = load_state(engine.run_dir)
+    recovered_task = recovered_state.tasks["1.1"]
+    assert recovered.paused and "spec approval" in recovered.paused_reason
+    assert recovered_task.phase == Phase.DEV_VERIFY
+    assert recovered_task.accepted_dev_session_index == 0
+    assert recovered_task.review_continuation_pending
+    assert recovered_task.reverify_replayed == "incomplete-review"
+    assert continued_adapter.sessions == []
+    assert any(
+        row["origin"] == "incomplete-review" and row["action"] == "proceed"
+        for row in _kinds(continued, "reverify-decision")
+    )
+    continuation_verifies = [
+        row
+        for row in _kinds(continued, "verify-command-result")
+        if row["verification_stage"] == "dev"
+    ]
+    assert continuation_verifies[-1]["returncode"] == 0
+    assert [session.role for session in recovered_task.sessions] == ["dev", "review"]
+
+    recovered_state.clear_pause()
+    save_state(engine.run_dir, recovered_state)
+    final_adapter = MockAdapter([successful_review])
+    final = TicketsEngine(
+        paths=engine.paths,
+        policy=policy,
+        adapter=final_adapter,
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=recovered_state,
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+    finished = final.run()
+
+    assert finished.done == 1
+    assert [session.role for session in final_adapter.sessions] == ["review"]
+    final_task = load_state(engine.run_dir).tasks["1.1"]
+    assert final_task.phase == Phase.DONE and final_task.accepted_dev_session_index == 0
+    assert [session.role for session in final_task.sessions] == ["dev", "review", "review"]
 
 
 def test_review_converges_on_a_built_plan(project_v7, monkeypatch):

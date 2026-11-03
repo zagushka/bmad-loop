@@ -26455,6 +26455,7 @@ def test_reverify_crash_mid_review_after_a_passing_replay_re_verifies(project, t
     assert crashed.phase == Phase.REVIEW_RUNNING
     assert crashed.reverify_from == ""
     assert crashed.reverify_replayed == "deferred"
+    assert crashed.accepted_dev_session_index == 1
     assert not [s for s in crashed.sessions if s.role == "review"]
     crashed_generation = crashed.generation
 
@@ -26568,6 +26569,7 @@ def test_reverify_with_the_environment_still_down_re_defers_without_a_session(pr
     task = load_state(engine2.run_dir).tasks["1-1-a"]
     assert task.phase == Phase.DEFERRED
     assert task.reverify_from == ""
+    assert task.accepted_dev_session_index is None
     [decision] = _rows(engine2, "reverify-decision")
     assert decision["action"] == "defer" and decision["env_fault"] is False
     assert decision["reason"].startswith("reverify failed: ")
@@ -26667,6 +26669,8 @@ def test_reverify_honors_the_spec_approval_gate(project, tmp_path):
     assert summary.paused and engine2.state.paused_stage == PAUSE_SPEC_APPROVAL
     task = load_state(engine2.run_dir).tasks["1-1-a"]
     assert task.phase == Phase.DEV_VERIFY and task.reverify_from == ""
+    assert task.accepted_dev_session_index == 1
+    assert task.reverify_replayed == "deferred"
 
     engine3, adapter3 = resume_engine(project, engine2, [])
     engine3.run()
