@@ -4628,6 +4628,31 @@ def test_verify_dev_tickets_non_ascii_digit_id_retries(project):
     assert not out.ok and out.retryable
 
 
+@pytest.mark.parametrize("result_status", [None, [], {}])
+def test_verify_dev_tickets_review_continuation_rejects_non_string_result_status(
+    project, result_status
+):
+    task = make_ticket_task(project)
+    task.review_cycle = 1
+    plan = write_ticket_plan(project, "blocked", baseline=task.baseline_commit)
+    _real_work(project)
+    result = {"workflow": "auto-dev", "spec_file": str(plan)}
+    if result_status is not None:
+        result["status"] = result_status
+
+    out = verify.verify_dev_tickets(
+        task,
+        project,
+        result,
+        plan=plan,
+        ticket_id="7",
+        review_continuation=True,
+    )
+
+    assert not out.ok and out.retryable
+    assert out.reason == "review-continuation verification requires a string result status"
+
+
 def test_verify_dev_tickets_plan_halt_requires_marker(project):
     """A plan-halt leg expects `ready-for-dev`, skips proof-of-work (only the plan
     was written), and demands devcontract's `plan_halt` marker so a
@@ -12984,10 +13009,7 @@ def test_commit_path_bound_recovers_post_commit_timeout(project, monkeypatch):
     repo, path, baseline, accepted = _bound_publish_inputs(project)
     hook = repo / ".git" / "hooks" / "reference-transaction"
     hook.write_text(
-        "#!/bin/sh\n"
-        "if [ \"$1\" = committed ] && grep -q ' refs/heads/'; then\n"
-        "  sleep 4\n"
-        "fi\n"
+        "#!/bin/sh\nif [ \"$1\" = committed ] && grep -q ' refs/heads/'; then\n  sleep 4\nfi\n"
     )
     hook.chmod(0o755)
     outcomes = _bound_transaction_only(monkeypatch, 2)
@@ -13020,10 +13042,7 @@ def test_commit_path_bound_hands_the_prepared_probe_its_fractional_remaining(pro
     repo, path, baseline, accepted = _bound_publish_inputs(project)
     hook = repo / ".git" / "hooks" / "reference-transaction"
     hook.write_text(
-        "#!/bin/sh\n"
-        "if [ \"$1\" = prepared ] && grep -q ' refs/heads/'; then\n"
-        "  sleep 0.2\n"
-        "fi\n"
+        "#!/bin/sh\nif [ \"$1\" = prepared ] && grep -q ' refs/heads/'; then\n  sleep 0.2\nfi\n"
     )
     hook.chmod(0o755)
     budget = 5

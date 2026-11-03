@@ -9449,6 +9449,10 @@ def verify_dev_tickets(
                 "plan_halt results cannot use review-continuation verification"
             )
         result_status = rj.get("status")
+        if not isinstance(result_status, str):
+            return VerifyOutcome.retry(
+                "review-continuation verification requires a string result status"
+            )
         allowed_plan_statuses = {
             "blocked": {"blocked", "in-review"},
             "built": {"built", "blocked", "in-review"},

@@ -10708,6 +10708,44 @@ def test_review_continuation_refuses_a_completed_review_before_mutation(tmp_path
     assert (run_dir / "state.json").read_bytes() == before
 
 
+@pytest.mark.parametrize("dev_status", [None, [], {}])
+def test_review_continuation_refuses_non_string_dev_status_without_mutation(tmp_path, dev_status):
+    """Malformed retained result statuses refuse admission without a hash error."""
+    from bmad_loop.model import PAUSE_ESCALATION, SessionRecord
+
+    run_dir, spec_path = _reverify_run(tmp_path, phase="escalated")
+    spec_path.write_text(
+        "---\nstatus: blocked\nroute: full\nreview: thorough\n---\n\nplan\n",
+        encoding="utf-8",
+    )
+    state = load_state(run_dir)
+    state.source = "tickets"
+    task = state.tasks[_REVERIFY_KEY]
+    task.salvage_refile_pending = False
+    task.accepted_dev_session_index = 0
+    task.spec_file = str(spec_path.resolve())
+    dev_result = {"spec_file": str(spec_path.resolve()), "plan_halt": False}
+    if dev_status is not None:
+        dev_result["status"] = dev_status
+    task.sessions[0].result_json = dev_result
+    task.sessions.append(
+        SessionRecord(
+            task_id="review-blocked",
+            role="review",
+            status="completed",
+            result_json={"status": "blocked", "spec_file": str(spec_path.resolve())},
+        )
+    )
+    state.paused_stage = PAUSE_ESCALATION
+    save_state(run_dir, state)
+    before = (run_dir / "state.json").read_bytes()
+
+    with pytest.raises(runs.RearmError, match="no accepted blocked or built dev candidate"):
+        runs.continue_review(run_dir, _REVERIFY_KEY, project_root=spec_path.parents[2])
+
+    assert (run_dir / "state.json").read_bytes() == before
+
+
 def test_review_continuation_admits_explicit_blocked_ticket_candidate_without_review_cycle(
     tmp_path,
 ):

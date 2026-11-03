@@ -6541,7 +6541,8 @@ def review_continuation_refusal(
                     or Path(str(result["spec_file"])).resolve() != plan_path
                 ):
                     return f"story {story_key}'s {label} result does not bind its recorded plan"
-            if dev.result_json.get("status") not in {"blocked", "built"}:
+            dev_status = dev.result_json.get("status")
+            if not isinstance(dev_status, str) or dev_status not in {"blocked", "built"}:
                 return f"story {story_key} has no accepted blocked or built dev candidate"
             try:
                 fields = parse_frontmatter(plan_path.read_text(encoding="utf-8-sig"))
