@@ -10846,9 +10846,7 @@ def patch_new_files(patch_path: Path) -> set[str]:
     return new_files
 
 
-def unpublishable_target(
-    target: Path, family: Literal["ledger", "store"]
-) -> (
+def unpublishable_target(target: Path, family: Literal["ledger", "store"]) -> (
     tuple[
         Literal["target-absent", "target-unreadable", "target-not-a-file", "target-undecodable"],
         str | None,

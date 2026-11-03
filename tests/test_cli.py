@@ -11914,9 +11914,7 @@ def _codex_version_findings(
             (
                 f"launch_args = {json.dumps(list(overlay_launch_args))}"
                 if line.startswith("launch_args")
-                else 'name = "codex-mine"'
-                if line.startswith("name =")
-                else line
+                else 'name = "codex-mine"' if line.startswith("name =") else line
             )
             for line in shipped.splitlines()
         ]
@@ -13954,9 +13952,9 @@ def test_validate_inspects_old_registered_script_before_migration(project, capsy
     assert install_into(project.project, clis=("claude",), skills=False) == 0
     config = project.project / ".claude/settings.json"
     data = json.loads(config.read_text())
-    data["hooks"]["Stop"][0]["hooks"][0]["command"] = (
-        'python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
-    )
+    data["hooks"]["Stop"][0]["hooks"][0][
+        "command"
+    ] = 'python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
     config.write_text(json.dumps(data))
     capsys.readouterr()
 
@@ -14057,9 +14055,9 @@ def test_validate_skips_legacy_script_relay_under_windows_host(
     assert install_into(project.project, clis=("claude",), skills=False) == 0
     config = project.project / ".claude/settings.json"
     data = json.loads(config.read_text())
-    data["hooks"]["Stop"][0]["hooks"][0]["command"] = (
-        'python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
-    )
+    data["hooks"]["Stop"][0]["hooks"][0][
+        "command"
+    ] = 'python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
     config.write_text(json.dumps(data))
     (project.project / ".bmad-loop/bmad_loop_hook.py").write_text("# legacy script\n")
     moved = tmp_path / "a&b" / "proj"
@@ -21079,9 +21077,9 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     # the gate saw the honest bytes and passed
     factory("epic-boundary", started=lambda: signalled.append("started"))
 
-    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
-        "the swap must actually have landed on disk, or this test proves nothing"
-    )
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
     assert captured["only_ids"] is None and captured["min_severity"] is None
     assert signalled == ["started"]  # #501: the child composed, so the parent may latch
@@ -21722,9 +21720,9 @@ def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli.main(["run", "--project", str(project.project)]) == 0
 
-    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
-        "the swap must actually have landed on disk, or this test proves nothing"
-    )
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
     run_id = captured["state"].run_id
     assert runs.read_trusted_config_digest(project.project, run_id)[0] == pin
@@ -21782,9 +21780,9 @@ def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
-    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
-        "the swap must actually have landed on disk, or this test proves nothing"
-    )
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
     assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == pin
 

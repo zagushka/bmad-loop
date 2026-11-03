@@ -12814,9 +12814,9 @@ def test_resolve_finished_run_replays_the_kept_unit_of_a_moved_project(
     marker.write_text("up\n")
     _mock_adapters(monkeypatch)
 
-    assert _resolve_finished(project, engine, "--story", "1-1-a", "--resume") == 0, (
-        capsys.readouterr().err
-    )
+    assert (
+        _resolve_finished(project, engine, "--story", "1-1-a", "--resume") == 0
+    ), capsys.readouterr().err
 
     [replay_dir] = _replay_dirs(engine)
     replay = load_state(replay_dir)

@@ -2529,9 +2529,7 @@ def _warn_preflight_would_abort(
     store_source = (
         worksource.SOURCE_TICKETS
         if require_tickets
-        else _sweep_store_source(paths, pol)
-        if require_sweep
-        else None
+        else _sweep_store_source(paths, pol) if require_sweep else None
     )
     if store_source is not None and (
         store := ticketstore.store_conflict(paths.project, store_source, pol.scm.isolation)
@@ -2653,9 +2651,7 @@ def _require_base_skills(
             or (
                 "tickets"
                 if require_tickets
-                else "stories"
-                if require_stories
-                else pol.stories.source
+                else "stories" if require_stories else pol.stories.source
             ),
         )
         if runtime is not None and pol.scm.isolation != "worktree":

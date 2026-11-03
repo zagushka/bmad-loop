@@ -37,11 +37,11 @@ from . import (
     codex_trust,
     deferredwork,
     gates,
+    legacy_runtime,
     sprintstatus,
     ticketstore,
     verify,
     worksource,
-    legacy_runtime,
     workspace_trust,
 )
 from .adapters.profile import ProfileError
@@ -3821,9 +3821,7 @@ class WorktreeFlow:
             else (
                 str(attempt["pre_target_revision"])
                 if attempt is not None
-                else verify.ref_revision(repo, target_ref)
-                if receipt_required
-                else target
+                else verify.ref_revision(repo, target_ref) if receipt_required else target
             )
         )
 

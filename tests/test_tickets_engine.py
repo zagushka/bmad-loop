@@ -60,11 +60,11 @@ from bmad_loop.ticketmodel import EpicRow
 from bmad_loop.tickets_engine import TicketsEngine
 from bmad_loop.tickets_source import TicketRef, ticket_binding
 from bmad_loop.tickettree import (
-    TicketTree,
     TicketsCrashed,
     TicketsLockBusy,
     TicketsParentInitiative,
     TicketsPlanIOError,
+    TicketTree,
     V6KeyClaim,
 )
 from bmad_loop.workspace import Workspace

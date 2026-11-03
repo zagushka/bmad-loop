@@ -46,9 +46,9 @@ def _rpc(root: Path, data: dict, status: str = "trusted") -> dict:
 @pytest.mark.parametrize("event", ["SessionStart", "Stop"])
 def test_trust_rejects_old_script_command_for_each_required_event(tmp_path, monkeypatch, event):
     data = _config(tmp_path)
-    data["hooks"][event][0]["hooks"][0]["command"] = (
-        f"python3 {tmp_path / '.bmad-loop/bmad_loop_hook.py'} {event}"
-    )
+    data["hooks"][event][0]["hooks"][0][
+        "command"
+    ] = f"python3 {tmp_path / '.bmad-loop/bmad_loop_hook.py'} {event}"
     (tmp_path / ".codex/hooks.json").write_text(json.dumps(data))
     monkeypatch.setattr(
         codex_trust,
@@ -289,9 +289,9 @@ def test_trust_refuses_relay_for_old_checkout_and_startup_excluding_matcher(tmp_
     assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "untrusted"
 
     data["hooks"]["SessionStart"][0].pop("matcher")
-    data["hooks"]["Stop"][0]["hooks"][0]["command"] = (
-        f"python3 {tmp_path / 'old-checkout/.bmad-loop/bmad_loop_hook.py'} Stop"
-    )
+    data["hooks"]["Stop"][0]["hooks"][0][
+        "command"
+    ] = f"python3 {tmp_path / 'old-checkout/.bmad-loop/bmad_loop_hook.py'} Stop"
     (tmp_path / ".codex/hooks.json").write_text(json.dumps(data), encoding="utf-8")
     assert codex_trust.project_hook_trust(tmp_path, get_profile("codex")).status == "untrusted"
 
