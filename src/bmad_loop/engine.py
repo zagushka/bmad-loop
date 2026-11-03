@@ -2557,6 +2557,26 @@ class Engine:
                 finally:
                     self.workspace = prev
                 self._integrate_unit(task, unit)
+            elif (
+                task.review_continuation_pending
+                and task.reverify_replayed == "incomplete-review"
+                and not task.reverify_from
+                and task.phase == Phase.DEV_VERIFY
+            ):
+                # A normal resume from the spec-approval pause follows the already
+                # persisted PROCEED. Recheck the operator-selected candidate, then
+                # enter review directly without replaying verification or pausing
+                # at the same approval gate again.
+                self.journal.append("resume-review-continuation", story_key=task.story_key)
+                self._release_orphaned_mount(task)
+                if refusal := runs.review_continuation_source_refusal(
+                    self.state, task, project_root=self.paths.project
+                ):
+                    task.review_continuation_pending = False
+                    task.reverify_replayed = ""
+                    self._escalate(task, refusal)
+                else:
+                    self._review_and_commit(task, review_continuation=True)
             elif task.review_continuation_pending and task.phase in {
                 Phase.DEV_VERIFY,
                 Phase.REVIEW_VERIFY,

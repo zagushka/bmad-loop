@@ -1391,8 +1391,12 @@ def _reviews(layout: V7Layout, plan: Path):
     return review
 
 
+@pytest.mark.parametrize(
+    ("approval_gate", "change_after_approval"),
+    [(False, False), (True, False), (True, True)],
+)
 def test_review_continuation_verifies_blocked_ticket_then_dispatches_review(
-    project_v7, monkeypatch
+    project_v7, monkeypatch, approval_gate, change_after_approval
 ):
     blocked_at = "2026-11-03T10:00:00Z"
     blocked_reason = "nested thorough review incomplete"
@@ -1405,7 +1409,7 @@ def test_review_continuation_verifies_blocked_ticket_then_dispatches_review(
         ),
     )
     policy = Policy(
-        gates=GatesPolicy(mode="none"),
+        gates=GatesPolicy(mode="per-story-spec-approval" if approval_gate else "none"),
         notify=QUIET,
         review=ReviewPolicy(enabled=True, trigger="recommended"),
         verify=VerifyPolicy(commands=("git diff --check",)),
@@ -1449,6 +1453,16 @@ def test_review_continuation_verifies_blocked_ticket_then_dispatches_review(
                 "status": "blocked",
                 "spec_file": str(plan.resolve()),
                 "followup_review_recommended": False,
+                "escalations": [
+                    {
+                        "type": "blocked",
+                        "severity": "CRITICAL",
+                        "detail": "review incomplete",
+                        "spec_file": str(plan.resolve()),
+                    }
+                ],
+                "park_asserted": False,
+                "artifact_only": False,
             },
         )
     )
@@ -1547,25 +1561,50 @@ def test_review_continuation_verifies_blocked_ticket_then_dispatches_review(
         state=crash_state,
         ticket_tree_factory=lambda root, pin: tree,
     )
-    emit = resumed_again._emit
+    if approval_gate:
+        approval_pause = resumed_again.run()
+        assert approval_pause.paused and "spec approval" in approval_pause.paused_reason
+        proceed_state = load_state(engine.run_dir)
+        proceed_task = proceed_state.tasks["1.1"]
+        assert proceed_state.paused_stage == "spec-approval"
+        assert (
+            proceed_task.phase == Phase.DEV_VERIFY
+            and proceed_task.reverify_from == ""
+            and proceed_task.reverify_replayed == "incomplete-review"
+            and proceed_task.review_continuation_pending
+        )
+        assert (
+            proceed_task.accepted_dev_session_index == 0
+            and proceed_task.attempt == 1
+            and proceed_task.generation == 0
+            and proceed_task.review_cycle == 0
+        )
+        proceed_state.clear_pause()  # mirror the normal CLI resume path
+        if change_after_approval:
+            (project_v7.project / "src.txt").write_text(
+                "changed after spec approval\n", encoding="utf-8"
+            )
+        save_state(engine.run_dir, proceed_state)
+    else:
+        emit = resumed_again._emit
 
-    def crash_after_proceed_save(stage, task=None, **kwargs):
-        result = emit(stage, task, **kwargs)
-        if stage == "post_dev_phase":
-            raise RuntimeError("crash after review continuation PROCEED save")
-        return result
+        def crash_after_proceed_save(stage, task=None, **kwargs):
+            result = emit(stage, task, **kwargs)
+            if stage == "post_dev_phase":
+                raise RuntimeError("crash after review continuation PROCEED save")
+            return result
 
-    monkeypatch.setattr(resumed_again, "_emit", crash_after_proceed_save)
-    crashed = resumed_again.run()
-    assert crashed.crashed and "PROCEED save" in crashed.crash_error
-    proceed_state = load_state(engine.run_dir)
-    proceed_task = proceed_state.tasks["1.1"]
-    assert (
-        proceed_task.phase == Phase.DEV_VERIFY
-        and proceed_task.reverify_from == ""
-        and proceed_task.reverify_replayed == "incomplete-review"
-        and proceed_task.review_continuation_pending
-    )
+        monkeypatch.setattr(resumed_again, "_emit", crash_after_proceed_save)
+        crashed = resumed_again.run()
+        assert crashed.crashed and "PROCEED save" in crashed.crash_error
+        proceed_state = load_state(engine.run_dir)
+        proceed_task = proceed_state.tasks["1.1"]
+        assert (
+            proceed_task.phase == Phase.DEV_VERIFY
+            and proceed_task.reverify_from == ""
+            and proceed_task.reverify_replayed == "incomplete-review"
+            and proceed_task.review_continuation_pending
+        )
     attempt, generation, cycle = (
         proceed_task.attempt,
         proceed_task.generation,
@@ -1582,7 +1621,33 @@ def test_review_continuation_verifies_blocked_ticket_then_dispatches_review(
         state=proceed_state,
         ticket_tree_factory=lambda root, pin: tree,
     )
+    review_calls = []
+    if approval_gate and change_after_approval:
+        review_and_commit = resumed_twice._review_and_commit
+
+        def record_review_dispatch(task, *args, **kwargs):
+            review_calls.append(task.story_key)
+            return review_and_commit(task, *args, **kwargs)
+
+        monkeypatch.setattr(resumed_twice, "_review_and_commit", record_review_dispatch)
     summary = resumed_twice.run()
+
+    if approval_gate and change_after_approval:
+        assert (
+            summary.paused
+            and "changed after review continuation was armed" in summary.paused_reason
+        )
+        assert review_calls == []  # refuse before entering review orchestration
+        assert resumed_adapter.sessions == []
+        refused = load_state(engine.run_dir).tasks["1.1"]
+        assert refused.phase == Phase.ESCALATED
+        assert (refused.attempt, refused.generation, refused.review_cycle) == (
+            attempt,
+            generation,
+            cycle,
+        )
+        assert native_marks == [("in-review", "rearm", "written")]
+        return
 
     assert summary.done == 1 and not summary.paused
     assert [session.role for session in resumed_adapter.sessions] == ["review"]
@@ -1595,7 +1660,9 @@ def test_review_continuation_verifies_blocked_ticket_then_dispatches_review(
         for row in _kinds(resumed_again, "verify-command-result")
         if row["verification_stage"] == "dev"
     ]
-    assert len(dev_verifies) == 3 and all(row["returncode"] == 0 for row in dev_verifies)
+    expected_dev_verifies = 2
+    assert len(dev_verifies) == expected_dev_verifies
+    assert all(row["returncode"] == 0 for row in dev_verifies)
     finished = load_state(engine.run_dir).tasks["1.1"]
     assert finished.phase == Phase.DONE and finished.review_cycle == cycle + 1
     assert (finished.attempt, finished.generation) == (attempt, generation)
