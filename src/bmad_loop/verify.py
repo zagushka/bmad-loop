@@ -7479,8 +7479,7 @@ def apply_incoming_collision_plan(
         parent = (repo / path).parent.resolve()
         if parent != repo_res and not parent.is_relative_to(repo_res):
             raise OSError(
-                f"refusing to clean incoming collision outside repository {repo_res}: "
-                f"{repo / path}"
+                f"refusing to clean incoming collision outside repository {repo_res}: {repo / path}"
             )
         prune_starts[path] = parent
     tracked_cleaned = [path for path in plan.cleaned if path not in untracked]
@@ -9154,8 +9153,7 @@ def verify_dev_bundle(
         status = status_of(fm)
         if status not in accept_statuses:
             return VerifyOutcome.retry(
-                f"spec status is {status!r}, expected one of {sorted(accept_statuses)}: "
-                f"{spec_path}"
+                f"spec status is {status!r}, expected one of {sorted(accept_statuses)}: {spec_path}"
             )
         expected_status = status
     gate = _verify_shared_gates(
@@ -9372,6 +9370,7 @@ def verify_dev_tickets(
     plan: Path,
     ticket_id: str,
     plan_halt: bool = False,
+    review_continuation: bool = False,
     operator_park: bool = False,
     engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
@@ -9396,6 +9395,9 @@ def verify_dev_tickets(
       skips proof-of-work as :func:`verify_dev_stories` does. ``awaiting-operator``
       when ``operator_park`` is on and the plan declares it, held to the same
       actions gate and park-assertion waiver as :func:`verify_dev`.
+      ``blocked`` is accepted only on the explicit review-continuation leg, which
+      requires the completed result to say ``blocked`` too and keeps the same
+      baseline and proof-of-work gates.
     - A ``dropped`` plan escalates as a contradiction: a human withdrew the ticket
       while its session ran, and no retry can build a dropped ticket.
 
@@ -9413,8 +9415,7 @@ def verify_dev_tickets(
                     f"result instead: {claimed_path} (expected plan {plan})"
                 )
             return VerifyOutcome.retry(
-                f"dev result names {claimed_path}, but ticket {ticket_id!r} is bound "
-                f"to plan {plan}"
+                f"dev result names {claimed_path}, but ticket {ticket_id!r} is bound to plan {plan}"
             )
     if not plan.is_file():
         return VerifyOutcome.retry(f"bound ticket plan does not exist: {plan}")
@@ -9442,7 +9443,17 @@ def verify_dev_tickets(
             return actions
     skip_proof = parked and rj.get("park_asserted") is True
 
-    if plan_halt:
+    if review_continuation:
+        if plan_halt or rj.get("plan_halt") is True:
+            return VerifyOutcome.retry(
+                "plan_halt results cannot use review-continuation verification"
+            )
+        if rj.get("status") != "blocked" or status not in {"blocked", "in-review"}:
+            return VerifyOutcome.retry(
+                "review-continuation verification requires a blocked result and blocked or in-review plan"
+            )
+        expected = status
+    elif plan_halt:
         # The same synth-side cross-check verify_dev_stories makes: a
         # died-mid-flight ready-for-dev carries no marker.
         if rj.get("plan_halt") is not True:
@@ -10823,7 +10834,9 @@ def patch_new_files(patch_path: Path) -> set[str]:
     return new_files
 
 
-def unpublishable_target(target: Path, family: Literal["ledger", "store"]) -> (
+def unpublishable_target(
+    target: Path, family: Literal["ledger", "store"]
+) -> (
     tuple[
         Literal["target-absent", "target-unreadable", "target-not-a-file", "target-undecodable"],
         str | None,
@@ -11135,8 +11148,7 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
         if candidate_fault is not None:
             failed_path, error, stage = candidate_fault
             raise GitError(
-                f"no exact commit operand remains after {stage} failed "
-                f"for {failed_path}: {error}"
+                f"no exact commit operand remains after {stage} failed for {failed_path}: {error}"
             ) from error
         return None
     # Every operand is forced LITERAL: git reads a positional operand as a PATHSPEC,

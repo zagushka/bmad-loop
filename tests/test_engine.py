@@ -15261,6 +15261,109 @@ def test_review_loop_dispatch_pause_after_a_non_completed_pass_dispatches_next_c
     assert not _rows(engine2, "review-not-recommended")
 
 
+def test_explicit_review_continuation_verifies_candidate_without_dev_dispatch(project, tmp_path):
+    from bmad_loop.journal import Journal, load_state, save_state
+    from bmad_loop.model import PAUSE_ESCALATION, Phase
+    from bmad_loop.runs import continue_review
+
+    config = project.project / "_bmad" / "bmm" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "implementation_artifacts: '{project-root}/_bmad-output/implementation-artifacts'\n"
+        "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n",
+        encoding="utf-8",
+    )
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            rig.dies_during(review_effect(project, "1-1-a", clean=False, finalized=False)),
+        ],
+        policy=_env_policy(rig, limits=LimitsPolicy(max_review_cycles=3)),
+    )
+    engine.run()
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+
+    state = load_state(engine.run_dir)
+    task = state.tasks["1-1-a"]
+    task.phase = Phase.ESCALATED
+    task.env_fault_site = None
+    task.sessions[-1].status = "timeout"
+    task.sessions[-1].result_json = None
+    state.paused_stage = PAUSE_ESCALATION
+    state.paused_story_key = task.story_key
+    save_state(engine.run_dir, state)
+    attempt, generation, cycle = task.attempt, task.generation, task.review_cycle
+    accepted_dev = task.accepted_dev_session_index
+    # The generic dev fixture finalizes to done; select that retained artifact
+    # before arming so the continuation identity pins the exact candidate.
+    write_spec(Path(task.spec_file), "done", verify.rev_parse_head(project.project))
+    continue_review(engine.run_dir, task.story_key, project_root=project.project)
+
+    continued = load_state(engine.run_dir).tasks[task.story_key]
+    assert continued.phase == Phase.REVIEW_VERIFY and continued.review_continuation_pending
+    assert (continued.attempt, continued.generation, continued.review_cycle) == (
+        attempt,
+        generation,
+        cycle,
+    )
+    assert continued.accepted_dev_session_index == accepted_dev
+
+    rig.up.write_text("up\n")
+    engine2, adapter2 = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine2.run()
+
+    assert summary.done == 1, summary.paused_reason
+    assert [s.role for s in adapter2.sessions] == ["review"]
+    finished = engine2.state.tasks["1-1-a"]
+    assert finished.phase == Phase.DONE and finished.attempt == attempt
+    assert finished.generation == generation and finished.review_cycle == cycle + 1
+    kinds = [e["kind"] for e in Journal(engine2.run_dir).entries()]
+    assert "resume-review-continuation" in kinds and "resume-restart" not in kinds
+
+
+def test_review_continuation_crash_before_review_record_escalates_without_counter_reset(project):
+    """An unrecorded review launch is uncertain; preserve its charged counters and pause."""
+    from bmad_loop.model import SessionRecord, StoryTask
+
+    engine, adapter = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.phase = Phase.REVIEW_RUNNING
+    task.attempt = 4
+    task.generation = 7
+    task.review_cycle = 2
+    task.followup_reviews_spent = 1
+    task.reverify_replayed = "incomplete-review"
+    task.sessions.append(
+        SessionRecord(
+            task_id="1-1-a-dev-4",
+            role="dev",
+            status="completed",
+            result_json={"workflow": "auto-dev", "status": "blocked"},
+        )
+    )
+    engine.state.tasks[task.story_key] = task
+    engine.state.source = "tickets"
+    engine.state.finished = False
+    engine.state.clear_pause()
+    save_state(engine.run_dir, engine.state)
+
+    summary = engine.run()
+
+    assert summary.paused and "no automatic retry is safe" in summary.paused_reason
+    assert adapter.sessions == []
+    paused = load_state(engine.run_dir)
+    recovered = paused.tasks[task.story_key]
+    assert recovered.phase == Phase.ESCALATED
+    assert (recovered.attempt, recovered.generation, recovered.review_cycle) == (4, 7, 2)
+    assert recovered.followup_reviews_spent == 1
+    assert recovered.reverify_replayed == "" and not recovered.review_continuation_pending
+
+
 def test_isolated_review_dispatch_pause_after_a_non_completed_pass_reopens_unit(project, tmp_path):
     """DW-529, worktree variant of the guard above (same fabricated, today-unreachable
     shape: the cycle-1 record recast as crashed). The resume REOPENS the kept unit —

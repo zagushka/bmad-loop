@@ -32,6 +32,7 @@ from . import (
     envvars,
     gates,
     operatoractions,
+    runs,
     ticketstore,
     verify,
 )
@@ -2556,6 +2557,20 @@ class Engine:
                 finally:
                     self.workspace = prev
                 self._integrate_unit(task, unit)
+            elif task.review_continuation_pending and task.phase in {
+                Phase.DEV_VERIFY,
+                Phase.REVIEW_VERIFY,
+            }:
+                # The continuation owns this persisted phase even when a crash
+                # followed its PROCEED save before the review loop started. Re-arm
+                # the review-only verification origin before ordinary dev recovery
+                # can interpret DEV_VERIFY as a spec-approval pause.
+                self.journal.append("resume-review-continuation", story_key=task.story_key)
+                self._release_orphaned_mount(task)
+                task.phase = Phase.DEV_VERIFY
+                task.reverify_from = "incomplete-review"
+                self._save()
+                self._resume_reverify(task)
             elif task.reverify_from and task.phase == Phase.DEV_VERIFY:
                 # `resolve --reverify` (DW-522) re-armed a DEFERRED or env-fault
                 # ESCALATED story onto its kept attempt product. Ahead of the
@@ -2707,6 +2722,26 @@ class Engine:
                 else:
                     self._release_orphaned_mount(task)
                     self._review_and_commit(task, resumed_loop=True)
+            elif (
+                task.reverify_replayed == "incomplete-review"
+                and task.phase == Phase.REVIEW_RUNNING
+                and self._resumable_session(task) is None
+            ):
+                # The review cycle was charged, but no result was recorded for the
+                # dispatch. Do not reset counters or silently send this candidate
+                # through dev verification; an operator must resolve this uncertain
+                # review launch explicitly.
+                task.review_continuation_pending = False
+                task.reverify_replayed = ""
+                # REVIEW_RUNNING has one legal exit: REVIEW_VERIFY. Use that
+                # in-memory transition before the standard escalation transition;
+                # no intermediate state is saved and no review result is asserted.
+                advance(task, Phase.REVIEW_VERIFY)
+                self._escalate(
+                    task,
+                    "review continuation stopped before a review result was recorded; "
+                    "no automatic retry is safe",
+                )
             elif task.reverify_replayed:
                 # DW-527: a `resolve --reverify` replay PROCEEDed, then the host died
                 # mid-review/fix of that continuation. The task is neither DEFERRED
@@ -3981,6 +4016,7 @@ class Engine:
         resume_result: SessionResult | None = None,
         *,
         resumed_loop: bool = False,
+        review_continuation: bool = False,
     ) -> None:
         # A replayed REVIEW result finalized at `awaiting-operator` under
         # on_review_demotion = "park" is a review demotion (DW-383), not a dev park
@@ -4033,6 +4069,7 @@ class Engine:
         if (
             resume_result is None
             and not resumed_loop
+            and not review_continuation
             and self.policy.review.trigger == "recommended"
             and not task.followup_review_recommended
             and not task.salvage_refile_pending
@@ -4045,6 +4082,13 @@ class Engine:
             self._check_mounted_worktree_identity(task)
         if self._vetoed(pre_review_ctx, task):
             return
+        if review_continuation:
+            if refusal := runs.review_continuation_source_refusal(
+                self.state, task, project_root=self.paths.project
+            ):
+                task.review_continuation_pending = False
+                self._escalate(task, refusal)
+                return
         clean = False
         # Tracks whether the last *completed* review pass left the story finalized
         # (status: done) while still recommending an independent follow-up — the
@@ -4089,6 +4133,8 @@ class Engine:
                 task.review_cycle += 1
             refileable_followup = False  # only a completed pass this cycle can set it
             advance(task, Phase.REVIEW_RUNNING)
+            if review_continuation:
+                task.review_continuation_pending = False
             self._save()
             if resume_result is not None:
                 # the session already ran before the host died; its recorded
@@ -7417,9 +7463,20 @@ class Engine:
         if record is None or record.result_json is None:
             task.reverify_from = ""
             task.reverify_replayed = ""
+            task.review_continuation_pending = False
             self._escalate(task, "reverify: no completed dev result to re-verify")
             return
         result_json = record.result_json
+        if origin == "incomplete-review":
+            if refusal := runs.review_continuation_source_refusal(
+                self.state, task, project_root=self.paths.project
+            ):
+                task.reverify_from = ""
+                task.review_continuation_pending = False
+                task.reverify_replayed = ""
+                self._save()
+                self._escalate(task, refusal)
+                return
         self._disarm_ledger_snapshot(task)
         # The replay-safe board writer (never-regress, latest-wins); a refused row
         # escalates through `_escalate_board_refusal` as on the dev leg.
@@ -7439,6 +7496,22 @@ class Engine:
             verification_stage=verified.stage,
             verification_sequence=verified.sequence,
         )
+        if origin == "incomplete-review" and outcome.ok:
+            if task.review_cycle == 0 and not self._prepare_review_continuation(task):
+                task.reverify_from = ""
+                task.review_continuation_pending = False
+                task.reverify_replayed = ""
+                self._save()
+                return
+            if refusal := runs.review_continuation_source_refusal(
+                self.state, task, project_root=self.paths.project
+            ):
+                task.reverify_from = ""
+                task.review_continuation_pending = False
+                task.reverify_replayed = ""
+                self._save()
+                self._escalate(task, refusal)
+                return
         decision = decide_reverify(task, outcome)
         self.journal.append(
             "reverify-decision",
@@ -7450,6 +7523,10 @@ class Engine:
             verification_sequence=verified.sequence,
         )
         task.reverify_from = ""
+        if origin == "incomplete-review" and decision.action != Action.PROCEED:
+            task.review_continuation_pending = False
+        elif origin == "incomplete-review":
+            self._accept_current_dev_session(task)
         task.reverify_replayed = origin if decision.action == Action.PROCEED else ""
         if decision.action == Action.PROCEED:
             self._save()
@@ -7470,7 +7547,7 @@ class Engine:
                     PAUSE_SPEC_APPROVAL,
                     task.story_key,
                 )
-            self._review_and_commit(task)
+            self._review_and_commit(task, review_continuation=origin == "incomplete-review")
         elif decision.action == Action.DEFER:
             self._defer(task, decision.reason)
         elif outcome.env_fault:
@@ -7485,6 +7562,10 @@ class Engine:
         done_checkpoint pause, which must land after integration so a committed
         unit is merged before the run stops."""
         return
+
+    def _prepare_review_continuation(self, task: StoryTask) -> bool:
+        """Prepare a blocked ticket plan for an explicitly requested review pass."""
+        return True
 
     def _ledger_text(
         self, *, site: str, story_key: str | None = None

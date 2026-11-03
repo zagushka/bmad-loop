@@ -219,7 +219,7 @@ Resolves an escalated story, then re-arms it and resumes the run. Without a mode
 
 ```text
 bmad-loop resolve [--project PROJECT] [--story STORY] [--no-interactive]
-                  [--restore-patch PATH | --adopt-branch | --reverify | --abandon] [--resume | --no-resume] [--force] run_id
+                  [--restore-patch PATH | --adopt-branch | --reverify | --continue-review | --abandon] [--resume | --no-resume] [--force] run_id
 ```
 
 | Option                     | Description                                                                                                                                  |
@@ -229,11 +229,12 @@ bmad-loop resolve [--project PROJECT] [--story STORY] [--no-interactive]
 | `--restore-patch PATH`     | Re-arm the spec to `in-review` and re-apply this saved patch, so review resumes on the attempted change.                                     |
 | `--adopt-branch`           | Commit and merge the kept worktree branch as-is and mark the story done. Worktree isolation only; not for sweeps.                            |
 | `--reverify`               | Keep a DEFERRED (or environment-fault ESCALATED) story's attempt, replay `[verify]`, then review and commit. No dev session; not for sweeps. |
+| `--continue-review`        | Continue review on the operator-selected retained in-place candidate. Preserves attempt and usage counters; no dev session. Refuses unsupported or changed candidates. |
 | `--abandon`                | Close an escalated replay run unmerged: park dirty work on a preserve ref, remove the worktree, keep the branch.                             |
 | `--resume` / `--no-resume` | Resume without prompting / only re-arm. Default: prompt, then resume. Not with `--abandon` (exit 2).                                         |
 | `--force`                  | Proceed when engine liveness cannot be verified. A provably live engine still blocks.                                                        |
 
-- `--restore-patch`, `--adopt-branch`, `--reverify` and `--abandon` are mutually exclusive.
+- `--restore-patch`, `--adopt-branch`, `--reverify`, `--continue-review` and `--abandon` are mutually exclusive.
 - Tickets mode: `--story` takes a ticket ref. The re-arm moves the plan through `tickets.py mark` to `ready-for-dev`, or `in-review` for a restore, and a refused move aborts it. Refused with exit 1 when the ticket store's layout changed since the run started. See the [tickets guide](../tickets-guide.md#parking-and-resolve).
 - `--reverify --story KEY` on a finished sprint run creates a new replay run for a kept DEFERRED worktree unit; the finished run is not modified.
 - Acts on a run paused at `escalation`, or on an unfinished story run with no pause stage and a story still escalated (a resume whose engine exited before run end leaves this). With no pause stage, `--story` must name an escalated story.

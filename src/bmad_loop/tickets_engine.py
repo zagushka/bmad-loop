@@ -1274,6 +1274,15 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             f"entries; the orchestrator owns their status and resolution."
         ) + (f" {tail}" if tail else "")
 
+    def _prepare_review_continuation(self, task: StoryTask) -> bool:
+        """Route the operator-approved blocked candidate to ticket review via mark."""
+        try:
+            self._route_plan(task, "in-review")
+        except OwnedPlanRefused as e:
+            self._escalate(task, f"review continuation could not re-arm the plan: {e}")
+            return False
+        return True
+
     def _sprint_board_instruction(self) -> str:
         """Tickets mode has no sprint board; the ticket plan's status is what the
         orchestrator owns instead. Build-auto marks its own plan ``blocked`` when it
@@ -1546,6 +1555,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             # every dispatched row has an id: backlog rows (no id) never dispatch
             ticket_id=ticket.id or ticket.ref,
             plan_halt=plan_halt,
+            review_continuation=(task.review_continuation_pending and task.review_cycle == 0),
             operator_park=self._operator_park_enabled(),
             engine_written=self._harvest_gate_exclude(task),
         )

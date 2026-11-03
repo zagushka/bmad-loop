@@ -6390,7 +6390,8 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # The resume's ticket-store refusal, judged ahead of the reverify/adopt
     # dispatches for the same reason: each persists its transition before the
     # resume that would refuse a changed store. The re-arm path judges it below.
-    early = reverify or getattr(args, "adopt_branch", False)
+    continue_review = getattr(args, "continue_review", False)
+    early = reverify or getattr(args, "adopt_branch", False) or continue_review
     if (
         early
         and state.source == worksource.SOURCE_TICKETS
@@ -6410,6 +6411,44 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # as --adopt-branch, and likewise ahead of the interactive session it never runs.
     if reverify:
         return _resolve_reverify(args, project, run_dir, state, task, story_key)
+
+    if continue_review:
+        continuation_policy = policy_mod.load(_policy_path(project))
+        if not continuation_policy.review.enabled:
+            print("error: --continue-review requires review.enabled = true", file=sys.stderr)
+            return 1
+        refusal = runs.review_continuation_refusal(
+            state,
+            task,
+            story_key,
+            project_root=project,
+            max_review_cycles=continuation_policy.limits.max_review_cycles,
+        )
+        if refusal is not None:
+            print(f"error: {refusal}", file=sys.stderr)
+            return 1
+        if args.resume is None and not _confirm(
+            f"continue review of the kept candidate for {story_key} and resume run {args.run_id}?"
+        ):
+            print("cancelled — run is still paused")
+            return 0
+        try:
+            runs.continue_review(
+                run_dir,
+                story_key,
+                project_root=project,
+                max_review_cycles=continuation_policy.limits.max_review_cycles,
+                force=args.force,
+            )
+        except runs.RearmError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        if args.resume is False:
+            print(
+                f"review continuation armed for {story_key} — resume when ready: bmad-loop resume {args.run_id}"
+            )
+            return 0
+        return _resume_paused_run(project, run_dir)
 
     # DW-386: adopt the kept branch instead of re-arming. Behind every gate above —
     # the same gates, in the same order, as the re-arm path — and ahead of the
@@ -9842,6 +9881,12 @@ def main(argv: list[str] | None = None) -> int:
         "accepted under any pause; on a FINISHED run, --story names a kept deferred "
         "worktree unit to replay in a new replay run, and the finished run stays "
         "finished (not for stories-mode runs)",
+    )
+    resolve_mode.add_argument(
+        "--continue-review",
+        action="store_true",
+        help="continue review on the operator-selected retained in-place candidate without a dev session; "
+        "preserves attempt and usage counters, and refuses unsupported or changed candidates",
     )
     resolve_mode.add_argument(
         "--abandon",

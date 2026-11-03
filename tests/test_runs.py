@@ -10670,6 +10670,102 @@ def test_rearm_for_reverify_moves_deferred_to_dev_verify_keeping_baseline(tmp_pa
     assert rows[0]["spec_restored"] is False
 
 
+def test_review_continuation_refuses_a_completed_review_before_mutation(tmp_path):
+    """Ablation: removing the incomplete-review status gate lets the mutation through."""
+    from bmad_loop.model import PAUSE_ESCALATION, SessionRecord
+
+    run_dir, spec_path = _reverify_run(tmp_path, phase="escalated")
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    task.salvage_refile_pending = False
+    task.accepted_dev_session_index = 0
+    task.sessions.append(
+        SessionRecord(task_id="review-complete", role="review", status="completed")
+    )
+    state.paused_stage = PAUSE_ESCALATION
+    save_state(run_dir, state)
+    before = (run_dir / "state.json").read_bytes()
+
+    with pytest.raises(runs.RearmError, match="not an incomplete review"):
+        runs.continue_review(run_dir, _REVERIFY_KEY, project_root=spec_path.parents[2])
+
+    assert (run_dir / "state.json").read_bytes() == before
+
+
+def test_review_continuation_admits_explicit_blocked_ticket_candidate_without_review_cycle(
+    tmp_path,
+):
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    run_dir, spec_path = _reverify_run(tmp_path, phase="escalated")
+    spec_path.write_text(
+        "---\nstatus: blocked\nblocked_reason: nested review incomplete\n"
+        "blocked_at: '2026-11-03T10:00:00Z'\nroute: full\nreview: thorough\n---\n\nplan\n",
+        encoding="utf-8",
+    )
+    state = load_state(run_dir)
+    state.source = "tickets"
+    state.paused_stage = PAUSE_ESCALATION
+    task = state.tasks[_REVERIFY_KEY]
+    task.salvage_refile_pending = False
+    task.review_cycle = 0
+    task.accepted_dev_session_index = None
+    task.spec_file = str(spec_path.resolve())
+    task.sessions[-1].result_json = {
+        "workflow": "auto-dev",
+        "status": "blocked",
+        "spec_file": str(spec_path.resolve()),
+        "plan_halt": False,
+        "escalations": [{"detail": "ignored prose"}],
+    }
+    save_state(run_dir, state)
+
+    task.sessions[-1].result_json["plan_halt"] = True
+    refusal = runs.review_continuation_refusal(
+        state, task, _REVERIFY_KEY, project_root=spec_path.parents[2]
+    )
+    assert refusal and "blocked candidate" in refusal
+
+    task.sessions[-1].result_json["plan_halt"] = False
+    save_state(run_dir, state)
+
+    refusal = runs.review_continuation_refusal(
+        state, task, _REVERIFY_KEY, project_root=spec_path.parents[2]
+    )
+
+    assert refusal is None
+    assert task.accepted_dev_session_index is None and task.review_cycle == 0
+
+    runs.continue_review(run_dir, _REVERIFY_KEY, project_root=spec_path.parents[2])
+    armed = load_state(run_dir)
+    armed_task = armed.tasks[_REVERIFY_KEY]
+    assert armed_task.review_continuation_source_identity
+    spec_path.write_text(
+        "\n".join(
+            line
+            for line in spec_path.read_text(encoding="utf-8")
+            .replace("status: blocked", "status: in-review")
+            .splitlines()
+            if not line.startswith(("blocked_reason:", "blocked_at:"))
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert (
+        runs.review_continuation_source_refusal(
+            armed, armed_task, project_root=spec_path.parents[2]
+        )
+        is None
+    )
+
+    candidate = spec_path.parents[2] / "app.py"
+    candidate.write_text("print('changed after operator selection')\n", encoding="utf-8")
+    source_refusal = runs.review_continuation_source_refusal(
+        armed, armed_task, project_root=spec_path.parents[2]
+    )
+    assert source_refusal and "changed after review continuation was armed" in source_refusal
+
+
 def test_rearm_for_reverify_accepts_a_verify_env_fault_escalation(tmp_path):
     from bmad_loop.model import Phase
 

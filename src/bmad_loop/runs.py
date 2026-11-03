@@ -51,7 +51,11 @@ from .adapters.multiplexer import (
     get_multiplexer,
     mux_usable,
 )
-from .escalation import cleared_pause_escalation_keys, unresolved_escalation_keys
+from .escalation import (
+    REVIEW_TIMEOUT_STATUSES,
+    cleared_pause_escalation_keys,
+    unresolved_escalation_keys,
+)
 from .frontmatter import auto_dev_baseline_of, parse_frontmatter, status_of
 from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state, state_lock
 from .model import (
@@ -3642,8 +3646,7 @@ class HeldSweepClosesError(Exception):
             remedy = f"Run `bmad-loop resume {run_id}` to land or reopen them first"
         else:
             what = (
-                "it could not be checked for sweep ledger closes whose code never "
-                f"landed: {reason}"
+                f"it could not be checked for sweep ledger closes whose code never landed: {reason}"
             )
             remedy = (
                 "Repair what could not be read and retry, or `bmad-loop resume "
@@ -6448,6 +6451,250 @@ def adopt_refusal(state: RunState, task: StoryTask, story_key: str) -> str | Non
     if not task.spec_file:
         return f"story {story_key} has no story spec to finish, so it cannot be adopted{rearm_hint}"
     return None
+
+
+def review_continuation_refusal(
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+    *,
+    project_root: Path,
+    max_review_cycles: int = 3,
+) -> str | None:
+    """Refuse review-only continuation unless the paused task still owns a verified candidate.
+
+    This intentionally supports only in-place story runs. It accepts either an
+    incomplete native review after an accepted dev result, or the explicit first
+    review of a blocked ticket candidate whose result and plan are both recorded;
+    no prose or failure reason can opt a task in.
+    """
+    hint = f"re-arm it with `bmad-loop resolve {state.run_id}` instead"
+    if state.run_type == "sweep":
+        return f"--continue-review is not supported for sweep runs ({story_key}); {hint}"
+    if state.finished or state.paused_stage != PAUSE_ESCALATION or task.phase != Phase.ESCALATED:
+        return (
+            f"story {story_key} is not an escalation-paused task eligible for review continuation"
+        )
+    if task.worktree_path:
+        return (
+            f"story {story_key} is in a kept worktree; review continuation is not supported there"
+        )
+    if not task.spec_file or task.plan_review_owed or task.plan_checkpoint_pending:
+        return f"story {story_key} has no ready implementation candidate for review"
+    if task.salvage_refile_pending:
+        return f"story {story_key} has pending review salvage and cannot be continued directly"
+    if task.attempt < 1 or task.review_cycle < 0 or not task.baseline_commit:
+        return f"story {story_key} has no recorded implementation attempt to continue"
+    if task.review_cycle >= max_review_cycles:
+        return f"story {story_key} has no review-cycle budget left to continue"
+    primary = [(i, session) for i, session in enumerate(task.sessions) if not session.label]
+    if not primary:
+        return f"story {story_key} has no primary session to continue"
+    dev_records = [(i, session) for i, session in primary if session.role == "dev"]
+    if not dev_records:
+        return f"story {story_key} has no completed implementation session"
+    dev_index, dev = dev_records[-1]
+    if dev.status != "completed" or dev.result_json is None:
+        return f"story {story_key} has no completed implementation candidate"
+    if task.review_cycle == 0:
+        if (
+            state.source != worksource.SOURCE_TICKETS
+            or primary[-1][1].role != "dev"
+            or dev.result_json.get("status") != "blocked"
+            or dev.result_json.get("plan_halt") is True
+            or any(session.role == "review" for _, session in primary)
+        ):
+            return f"story {story_key} has no blocked candidate awaiting its first review"
+        if (
+            not dev.result_json.get("spec_file")
+            or Path(str(dev.result_json["spec_file"])).resolve() != Path(task.spec_file).resolve()
+        ):
+            return f"story {story_key}'s blocked result does not bind its recorded plan"
+        try:
+            fields = parse_frontmatter(Path(task.spec_file).read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            return f"cannot read story {story_key}'s blocked plan ({e})"
+        if (
+            fields.get("status") != "blocked"
+            or fields.get("route") != "full"
+            or fields.get("review") != "thorough"
+        ):
+            return f"story {story_key}'s blocked result is not for a full thorough review plan"
+    else:
+        if primary[-1][1].role != "review":
+            return f"story {story_key}'s latest primary session is not a review"
+        review = primary[-1][1]
+        if review.status not in REVIEW_TIMEOUT_STATUSES:
+            return (
+                f"story {story_key}'s latest review is not an incomplete review ({review.status})"
+            )
+        if task.accepted_dev_session_index != dev_index:
+            return f"story {story_key} has no accepted implementation candidate"
+    try:
+        paths = bmadconfig.load_paths(project_root)
+        if str(paths.repo_root) != str(state.code_root):
+            return (
+                f"run {state.run_id}'s configured code root changed; restore it before continuing"
+            )
+        if not verify.is_ancestor(paths.repo_root, task.baseline_commit, "HEAD"):
+            return f"story {story_key}'s baseline is not an ancestor of the current candidate"
+        if verify._changes_since(paths.repo_root, task.baseline_commit) is not True:
+            return f"story {story_key} has no candidate changes above its baseline"
+    except (bmadconfig.BmadConfigError, OSError, verify.GitError, ValueError) as e:
+        return f"cannot verify story {story_key}'s candidate ({e})"
+    return None
+
+
+def review_continuation_source_identity(
+    state: RunState, task: StoryTask, *, project_root: Path
+) -> str:
+    """Fingerprint the selected candidate, normalizing ticket-owned transition metadata."""
+    paths = bmadconfig.load_paths(project_root)
+    repo = paths.repo_root
+    plan = task_spec_path(task, state).resolve(strict=True)
+    try:
+        plan_rel = plan.relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        plan_rel = None
+    fields = parse_frontmatter(plan.read_text(encoding="utf-8-sig"))
+    normalize_ticket_status = task.review_cycle == 0
+    if normalize_ticket_status and status_of(fields) not in {"blocked", "in-review"}:
+        raise ValueError("bound ticket plan status is outside the review-continuation transition")
+
+    digest = hashlib.sha256()
+    digest.update(b"bmad-review-continuation-v1\0")
+    digest.update(verify.rev_parse_head(repo).encode("ascii") + b"\0")
+    digest.update((task.baseline_commit or "").encode("ascii") + b"\0")
+    digest.update(str(plan).encode("utf-8") + b"\0")
+    git_env = {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}
+    diff_args = [
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        task.baseline_commit or "",
+        "--",
+        ".",
+    ]
+    if plan_rel is not None:
+        diff_args.append(f":(exclude,literal){plan_rel}")
+    diff = verify.git_bytes(repo, *diff_args, env=git_env)
+    if diff.returncode != 0:
+        raise verify.GitError("candidate tracked diff could not be read")
+    digest.update(diff.stdout)
+
+    untracked = verify.git_bytes(
+        repo, "ls-files", "--others", "--exclude-standard", "-z", env=git_env
+    )
+    if untracked.returncode != 0:
+        raise verify.GitError("candidate untracked paths could not be read")
+    for raw_path in sorted(path for path in untracked.stdout.split(b"\0") if path):
+        rel = os.fsdecode(raw_path)
+        if rel == plan_rel:
+            continue
+        candidate = repo / rel
+        info = os.lstat(candidate)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"candidate contains a non-regular untracked path: {rel}")
+        content = candidate.read_bytes()
+        digest.update(raw_path + b"\0" + str(info.st_mode).encode("ascii") + b"\0")
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+
+    text = plan.read_text(encoding="utf-8-sig")
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("bound ticket plan has no frontmatter")
+    normalized: list[str] = []
+    in_frontmatter = True
+    closed = False
+    for index, line in enumerate(lines):
+        if index and in_frontmatter and line.strip() == "---":
+            in_frontmatter = False
+            closed = True
+            normalized.append(line)
+            continue
+        if (
+            normalize_ticket_status
+            and in_frontmatter
+            and re.match(r"^(?:status|blocked_reason|blocked_at):", line)
+        ):
+            continue
+        normalized.append(line)
+    if not closed:
+        raise ValueError("bound ticket plan frontmatter is incomplete")
+    digest.update(b"\0bound-plan\0")
+    digest.update("".join(normalized).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def review_continuation_source_refusal(
+    state: RunState, task: StoryTask, *, project_root: Path
+) -> str | None:
+    """Return a refusal if the operator-selected source changed after arming."""
+    expected = task.review_continuation_source_identity
+    if not expected:
+        return f"story {task.story_key} has no retained-source identity for review continuation"
+    try:
+        observed = review_continuation_source_identity(state, task, project_root=project_root)
+    except (bmadconfig.BmadConfigError, OSError, RuntimeError, ValueError, verify.GitError) as e:
+        return f"cannot verify retained source for {task.story_key}'s review continuation ({e})"
+    if observed != expected:
+        return f"retained source for {task.story_key} changed after review continuation was armed"
+    return None
+
+
+def continue_review(
+    run_dir: Path,
+    story_key: str,
+    *,
+    project_root: Path,
+    max_review_cycles: int = 3,
+    force: bool = False,
+) -> None:
+    """Arm a review-only continuation under the run lock, preserving attempt and usage."""
+    with state_lock(run_dir):
+        live = engine_liveness(run_dir)
+        if live == "alive" or (live == "unknown" and not force):
+            raise RearmError(
+                f"run {run_dir.name} is still live"
+                if live == "alive"
+                else f"run {run_dir.name} may still be live (unverifiable pid); pass --force only after confirming it stopped"
+            )
+        state = load_state(run_dir)
+        task = state.tasks.get(story_key)
+        if task is None:
+            raise RearmError(f"run {state.run_id} has no task for story {story_key}")
+        if (
+            refusal := review_continuation_refusal(
+                state,
+                task,
+                story_key,
+                project_root=project_root,
+                max_review_cycles=max_review_cycles,
+            )
+        ) is not None:
+            raise RearmError(refusal)
+        try:
+            task.review_continuation_source_identity = review_continuation_source_identity(
+                state, task, project_root=project_root
+            )
+        except (
+            bmadconfig.BmadConfigError,
+            OSError,
+            RuntimeError,
+            ValueError,
+            verify.GitError,
+        ) as e:
+            raise RearmError(
+                f"cannot bind retained source for {story_key}'s review continuation ({e})"
+            ) from e
+        task.phase = Phase.REVIEW_VERIFY
+        task.review_continuation_pending = True
+        state.clear_pause()
+        Journal(run_dir, pin=state).append("review-continuation-armed", story_key=story_key)
+        save_state(run_dir, state)
 
 
 def adopt_escalated_branch(run_dir: Path, story_key: str | None = None) -> str:

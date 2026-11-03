@@ -15,7 +15,15 @@ import os
 from pathlib import Path
 
 import pytest
-from conftest import DEFAULT_TREE, FakeTicketTree, V7Layout, git, ticket_row, write_ticket_tree
+from conftest import (
+    DEFAULT_TREE,
+    FakeTicketTree,
+    V7Layout,
+    git,
+    ticket_row,
+    write_plan,
+    write_ticket_tree,
+)
 
 from bmad_loop import runs, tickets_engine, tickets_source, verify
 from bmad_loop.adapters.base import SessionResult, SessionSpec
@@ -35,6 +43,7 @@ from bmad_loop.model import (
     PAUSE_TICKET_TREE,
     Phase,
     RunState,
+    SessionRecord,
     StoryTask,
 )
 from bmad_loop.policy import (
@@ -45,11 +54,13 @@ from bmad_loop.policy import (
     ReviewPolicy,
     ScmPolicy,
     TicketsPolicy,
+    VerifyPolicy,
 )
 from bmad_loop.ticketmodel import EpicRow
 from bmad_loop.tickets_engine import TicketsEngine
 from bmad_loop.tickets_source import TicketRef, ticket_binding
 from bmad_loop.tickettree import (
+    TicketTree,
     TicketsCrashed,
     TicketsLockBusy,
     TicketsParentInitiative,
@@ -1378,6 +1389,217 @@ def _reviews(layout: V7Layout, plan: Path):
         return SessionResult(status="completed", result_json=result)
 
     return review
+
+
+def test_review_continuation_verifies_blocked_ticket_then_dispatches_review(
+    project_v7, monkeypatch
+):
+    blocked_at = "2026-11-03T10:00:00Z"
+    blocked_reason = "nested thorough review incomplete"
+    tree = _tree(
+        project_v7,
+        blocked=(
+            ticket_row(
+                "1.1", status="blocked", blocked_at=blocked_at, blocked_reason=blocked_reason
+            ),
+        ),
+    )
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="recommended"),
+        verify=VerifyPolicy(commands=("git diff --check",)),
+    )
+    engine, _ = make_engine(project_v7, tree, policy=policy, source="tickets")
+    task = _bound(engine, tree)
+    baseline = verify.rev_parse_head(project_v7.project)
+    plan = write_plan(
+        project_v7,
+        "epic-cart",
+        "story-cart-model-plan",
+        1,
+        "blocked",
+        blocked_reason=blocked_reason,
+        blocked_at=blocked_at,
+        route="full",
+        review="thorough",
+        baseline_revision=baseline,
+    )
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    task.ticket = ticket_binding(tree.finds["1.1"])
+    (project_v7.project / "src.txt").write_text("retained candidate\n", encoding="utf-8")
+    git(project_v7.project, "add", "src.txt")
+    git(project_v7.project, "commit", "-q", "-m", "retained ticket candidate")
+
+    task.phase = Phase.ESCALATED
+    task.attempt = 1
+    task.review_cycle = 0
+    task.baseline_commit = baseline
+    task.spec_file = str(plan.resolve())
+    task.salvage_refile_pending = False
+    task.accepted_dev_session_index = None
+    task.followup_review_recommended = False
+    task.sessions.append(
+        SessionRecord(
+            task_id="1.1-dev-1",
+            role="dev",
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "status": "blocked",
+                "spec_file": str(plan.resolve()),
+                "followup_review_recommended": False,
+            },
+        )
+    )
+    task.review_continuation_pending = True
+    plan_halt_rejected = engine._verify_dev_artifacts(
+        task,
+        {
+            "workflow": "auto-dev",
+            "status": "blocked",
+            "spec_file": str(plan.resolve()),
+            "plan_halt": True,
+        },
+    )
+    assert not plan_halt_rejected.ok and "plan_halt" in plan_halt_rejected.reason
+    task.review_continuation_pending = False
+    task.plan_checkpoint_pending = False
+    engine.state.paused_stage = PAUSE_ESCALATION
+    engine.state.paused_story_key = task.story_key
+    save_state(engine.run_dir, engine.state)
+    runs.continue_review(engine.run_dir, task.story_key, project_root=project_v7.project)
+
+    native_tree = TicketTree(project_v7.project, pinned_initiative=project_v7.initiative)
+    real_mark = native_tree.mark
+    native_marks = []
+
+    def mark(ref, target, **kw):
+        result = real_mark(ref, target, **kw)
+        native_marks.append((result.after, kw["reason"], result.outcome))
+        if result.outcome == "written":
+            tree.finds["1.1"] = dataclasses.replace(
+                tree.finds["1.1"], row=ticket_row("1.1", status=target)
+            )
+        return result
+
+    monkeypatch.setattr(tree, "mark", mark)
+
+    def review(spec: SessionSpec) -> SessionResult:
+        current = Path(spec.cwd) / plan.relative_to(project_v7.project)
+        assert status_of(parse_frontmatter(current.read_text(encoding="utf-8"))) == "in-review"
+        current.write_text(
+            current.read_text(encoding="utf-8").replace("status: in-review", "status: built"),
+            encoding="utf-8",
+        )
+        tree.finds["1.1"] = dataclasses.replace(
+            tree.finds["1.1"], row=ticket_row("1.1", status="built")
+        )
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "status": "built",
+                "spec_file": str(current),
+                "followup_review_recommended": False,
+            },
+        )
+
+    state = load_state(engine.run_dir)
+    resumed_adapter = MockAdapter([review])
+    resumed = TicketsEngine(
+        paths=engine.paths,
+        policy=policy,
+        adapter=resumed_adapter,
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=state,
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+    prepare = resumed._prepare_review_continuation
+
+    def crash_after_native_mark(task):
+        assert prepare(task)
+        assert _plan_status(plan) == "in-review"
+        frontmatter = parse_frontmatter(plan.read_text(encoding="utf-8"))
+        assert not frontmatter.get("blocked_reason") and not frontmatter.get("blocked_at")
+        raise RuntimeError("crash after the native ticket mark")
+
+    monkeypatch.setattr(resumed, "_prepare_review_continuation", crash_after_native_mark)
+    crashed = resumed.run()
+    assert crashed.crashed, crashed.paused_reason
+    assert "crash after the native ticket mark" in crashed.crash_error
+    crash_state = load_state(engine.run_dir)
+    crash_task = crash_state.tasks["1.1"]
+    assert (
+        crash_task.phase == Phase.DEV_VERIFY
+        and crash_task.reverify_from == "incomplete-review"
+        and crash_task.review_continuation_pending
+    )
+
+    resumed_adapter = MockAdapter([review])
+    resumed_again = TicketsEngine(
+        paths=engine.paths,
+        policy=policy,
+        adapter=resumed_adapter,
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=crash_state,
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+    emit = resumed_again._emit
+
+    def crash_after_proceed_save(stage, task=None, **kwargs):
+        result = emit(stage, task, **kwargs)
+        if stage == "post_dev_phase":
+            raise RuntimeError("crash after review continuation PROCEED save")
+        return result
+
+    monkeypatch.setattr(resumed_again, "_emit", crash_after_proceed_save)
+    crashed = resumed_again.run()
+    assert crashed.crashed and "PROCEED save" in crashed.crash_error
+    proceed_state = load_state(engine.run_dir)
+    proceed_task = proceed_state.tasks["1.1"]
+    assert (
+        proceed_task.phase == Phase.DEV_VERIFY
+        and proceed_task.reverify_from == ""
+        and proceed_task.reverify_replayed == "incomplete-review"
+        and proceed_task.review_continuation_pending
+    )
+    attempt, generation, cycle = (
+        proceed_task.attempt,
+        proceed_task.generation,
+        proceed_task.review_cycle,
+    )
+
+    resumed_adapter = MockAdapter([review])
+    resumed_twice = TicketsEngine(
+        paths=engine.paths,
+        policy=policy,
+        adapter=resumed_adapter,
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=proceed_state,
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+    summary = resumed_twice.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert [session.role for session in resumed_adapter.sessions] == ["review"]
+    assert native_marks == [
+        ("in-review", "rearm", "written"),
+        ("done", "accept", "written"),
+    ]
+    dev_verifies = [
+        row
+        for row in _kinds(resumed_again, "verify-command-result")
+        if row["verification_stage"] == "dev"
+    ]
+    assert len(dev_verifies) == 3 and all(row["returncode"] == 0 for row in dev_verifies)
+    finished = load_state(engine.run_dir).tasks["1.1"]
+    assert finished.phase == Phase.DONE and finished.review_cycle == cycle + 1
+    assert (finished.attempt, finished.generation) == (attempt, generation)
+    assert finished.accepted_dev_session_index == 0
 
 
 def test_review_converges_on_a_built_plan(project_v7, monkeypatch):

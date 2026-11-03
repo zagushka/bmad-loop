@@ -127,6 +127,9 @@ breaking changes may land in a minor release.
 - Answer a parked permission prompt from the TUI (`Y` approve, `N` deny); keys are sent
   only while a fresh pane capture matches the profile's `[parked_answers]` guards, and
   journaled as `parked-answered`. Add `TerminalMultiplexer.send_keys` (#855).
+- Add `resolve --continue-review` to verify an operator-selected retained candidate and
+  resume its review without a dev session; preserve attempt and usage counters, and refuse
+  source changes before review dispatch.
 - Add `adapter.permission_mode` (`bypass` default, `sandboxed`): run sessions in a
   profile's non-blocking sandboxed mode instead of a full permission bypass (claude:
   `dontAsk` + `Edit(/**)` + the Bash sandbox; codex: a workspace-write permission profile

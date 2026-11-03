@@ -452,6 +452,13 @@ class StoryTask:
     # over an unreadable ledger. Resume retries that current review's salvage,
     # including authoritative verification, instead of rebuilding the attempt.
     salvage_refile_pending: bool = False
+    # An operator explicitly continued an incomplete review without re-arming the
+    # implementation attempt. Consumed by Engine._finish_inflight before restart.
+    review_continuation_pending: bool = False
+    # SHA-256 identity of the retained source the operator selected when arming a
+    # review-only continuation. The bound plan's status fields are the only edits
+    # normalized because the ticket engine owns that transition.
+    review_continuation_source_identity: str | None = None
     # Sweep migration recovery format. 0 is a pre-upgrade task whose restart
     # keeps the legacy reset-and-reread behavior; 1 requires the run-owned
     # baseline/manifest (and, by phase, rewrite/result) records.
@@ -857,6 +864,8 @@ class StoryTask:
             "escalations_resolved_upto": self.escalations_resolved_upto,
             "followup_review_recommended": self.followup_review_recommended,
             "salvage_refile_pending": self.salvage_refile_pending,
+            "review_continuation_pending": self.review_continuation_pending,
+            "review_continuation_source_identity": self.review_continuation_source_identity,
             "migration_recovery_format": self.migration_recovery_format,
             "migration_ledger_doubt_owned": self.migration_ledger_doubt_owned,
             "migration_commit_escalated": self.migration_commit_escalated,
@@ -1103,7 +1112,7 @@ class StoryTask:
                 )
             except ValueError as exc:
                 raise ValueError(
-                    f"story {d.get('story_key')!r}: dispatched_spec_snapshot " "is not valid base64"
+                    f"story {d.get('story_key')!r}: dispatched_spec_snapshot is not valid base64"
                 ) from exc
         return cls(
             story_key=d["story_key"],
@@ -1116,6 +1125,12 @@ class StoryTask:
             escalations_resolved_upto=int(d.get("escalations_resolved_upto", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),
             salvage_refile_pending=bool(d.get("salvage_refile_pending", False)),
+            review_continuation_pending=bool(d.get("review_continuation_pending", False)),
+            review_continuation_source_identity=(
+                str(d["review_continuation_source_identity"])
+                if d.get("review_continuation_source_identity") is not None
+                else None
+            ),
             migration_recovery_format=int(d.get("migration_recovery_format", 0)),
             migration_ledger_doubt_owned=bool(d.get("migration_ledger_doubt_owned", False)),
             migration_commit_escalated=bool(d.get("migration_commit_escalated", False)),

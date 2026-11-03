@@ -5503,7 +5503,7 @@ def test_resolve_force_unknown_proceeds(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
     run_dir = _escalated_run(tmp_path, "r1")
     resumed = []
-    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *args: resumed.append(args[-1]) or 0)
     rc = cli.main(
         ["resolve", "--project", str(tmp_path), "r1", "--force", "--no-interactive", "--resume"]
     )
@@ -5717,7 +5717,7 @@ def test_resolve_no_interactive_rearms_and_resumes(tmp_path, monkeypatch, capsys
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
 
     resumed = []
-    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *args: resumed.append(args[-1]) or 0)
     rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"])
     assert rc == 0
     assert resumed == [run_dir]
@@ -11914,7 +11914,9 @@ def _codex_version_findings(
             (
                 f"launch_args = {json.dumps(list(overlay_launch_args))}"
                 if line.startswith("launch_args")
-                else 'name = "codex-mine"' if line.startswith("name =") else line
+                else 'name = "codex-mine"'
+                if line.startswith("name =")
+                else line
             )
             for line in shipped.splitlines()
         ]
@@ -13952,9 +13954,9 @@ def test_validate_inspects_old_registered_script_before_migration(project, capsy
     assert install_into(project.project, clis=("claude",), skills=False) == 0
     config = project.project / ".claude/settings.json"
     data = json.loads(config.read_text())
-    data["hooks"]["Stop"][0]["hooks"][0][
-        "command"
-    ] = 'python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = (
+        'python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    )
     config.write_text(json.dumps(data))
     capsys.readouterr()
 
@@ -14055,9 +14057,9 @@ def test_validate_skips_legacy_script_relay_under_windows_host(
     assert install_into(project.project, clis=("claude",), skills=False) == 0
     config = project.project / ".claude/settings.json"
     data = json.loads(config.read_text())
-    data["hooks"]["Stop"][0]["hooks"][0][
-        "command"
-    ] = 'python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    data["hooks"]["Stop"][0]["hooks"][0]["command"] = (
+        'python3 "$CLAUDE_PROJECT_DIR"/.bmad-loop/bmad_loop_hook.py Stop'
+    )
     config.write_text(json.dumps(data))
     (project.project / ".bmad-loop/bmad_loop_hook.py").write_text("# legacy script\n")
     moved = tmp_path / "a&b" / "proj"
@@ -21077,9 +21079,9 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     # the gate saw the honest bytes and passed
     factory("epic-boundary", started=lambda: signalled.append("started"))
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     assert captured["only_ids"] is None and captured["min_severity"] is None
     assert signalled == ["started"]  # #501: the child composed, so the parent may latch
@@ -21720,9 +21722,9 @@ def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli.main(["run", "--project", str(project.project)]) == 0
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     run_id = captured["state"].run_id
     assert runs.read_trusted_config_digest(project.project, run_id)[0] == pin
@@ -21780,9 +21782,9 @@ def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == pin
 
@@ -24194,6 +24196,139 @@ def _reverify_project(tmp_path):
 
 def _resolve_reverify(project, *extra):
     return cli.main(["resolve", "--project", str(project), "r1", "--reverify", *extra])
+
+
+def _review_continuation_project(tmp_path):
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import PAUSE_ESCALATION, Phase, SessionRecord
+
+    run_dir, project = _reverify_project(tmp_path)
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    task.phase = Phase.ESCALATED
+    task.defer_reason = None
+    task.salvage_refile_pending = False
+    task.accepted_dev_session_index = 0
+    task.sessions.append(
+        SessionRecord(task_id="review-incomplete", role="review", status="timeout")
+    )
+    state.paused_stage = PAUSE_ESCALATION
+    state.paused_story_key = _REVERIFY_KEY
+    save_state(run_dir, state)
+    return run_dir, project
+
+
+def test_resolve_continue_review_preserves_candidate_and_usage(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import Journal, load_state
+    from bmad_loop.model import Phase
+
+    run_dir, project = _review_continuation_project(tmp_path)
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    task.tokens.input_tokens = 123
+    task.tokens.output_tokens = 45
+    attempt, cycle, generation = task.attempt, task.review_cycle, task.generation
+    from bmad_loop.journal import save_state
+
+    save_state(run_dir, state)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *args: resumed.append(args[-1]) or 0)
+    monkeypatch.setattr(
+        "bmad_loop.resolve.run_session", lambda *a, **k: pytest.fail("ran resolve agent")
+    )
+
+    rc = cli.main(["resolve", "--project", str(project), "r1", "--continue-review", "--resume"])
+
+    assert rc == 0 and resumed == [run_dir]
+    continued = load_state(run_dir).tasks[_REVERIFY_KEY]
+    assert (continued.attempt, continued.review_cycle, continued.generation) == (
+        attempt,
+        cycle,
+        generation,
+    )
+    assert (continued.tokens.input_tokens, continued.tokens.output_tokens) == (123, 45)
+    assert continued.phase == Phase.REVIEW_VERIFY and continued.review_continuation_pending
+    assert [e["kind"] for e in Journal(run_dir).entries()].count("review-continuation-armed") == 1
+
+
+def test_resolve_continue_review_admits_blocked_ticket_before_first_review(
+    tmp_path, monkeypatch, capsys
+):
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase
+
+    run_dir, project = _review_continuation_project(tmp_path)
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    task.sessions = [
+        session for session in task.sessions if not session.label and session.role == "dev"
+    ]
+    task.review_cycle = 0
+    task.accepted_dev_session_index = None
+    task.spec_file = str((project / task.spec_file).resolve())
+    task.sessions[-1].result_json = {
+        "workflow": "auto-dev",
+        "status": "blocked",
+        "spec_file": task.spec_file,
+        "escalations": [{"detail": "ignored prose"}],
+    }
+    state.source = "tickets"
+    Path(task.spec_file).write_text(
+        "---\nstatus: blocked\nroute: full\nreview: thorough\n---\n\nplan\n",
+        encoding="utf-8",
+    )
+    attempt, generation = task.attempt, task.generation
+    save_state(run_dir, state)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *args: resumed.append(args[-1]) or 0)
+    monkeypatch.setattr(
+        "bmad_loop.resolve.run_session", lambda *a, **k: pytest.fail("ran resolve agent")
+    )
+
+    rc = cli.main(["resolve", "--project", str(project), "r1", "--continue-review", "--resume"])
+
+    assert rc == 0 and resumed == [run_dir]
+    continued = load_state(run_dir).tasks[_REVERIFY_KEY]
+    assert (continued.attempt, continued.generation, continued.review_cycle) == (
+        attempt,
+        generation,
+        0,
+    )
+    assert continued.phase == Phase.REVIEW_VERIFY and continued.review_continuation_pending
+
+
+def test_resolve_continue_review_refuses_non_incomplete_review_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir, project = _review_continuation_project(tmp_path)
+    state = load_state(run_dir)
+    state.tasks[_REVERIFY_KEY].sessions[-1].status = "completed"
+    save_state(run_dir, state)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda *_: pytest.fail("prompted on refusal"))
+
+    rc = cli.main(["resolve", "--project", str(project), "r1", "--continue-review", "--resume"])
+
+    assert rc == 1
+    assert "not an incomplete review" in capsys.readouterr().err
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_continue_review_refuses_live_engine_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    run_dir, project = _review_continuation_project(tmp_path)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _rd: "alive")
+    monkeypatch.setattr(cli, "_confirm", lambda *_: pytest.fail("prompted on live run"))
+
+    rc = cli.main(["resolve", "--project", str(project), "r1", "--continue-review", "--resume"])
+
+    assert rc == 1
+    assert "still live" in capsys.readouterr().err
+    assert _state_bytes(run_dir) == before
 
 
 def test_resolve_reverify_rearms_and_resumes(tmp_path, monkeypatch, capsys):
