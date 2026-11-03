@@ -1193,6 +1193,28 @@ def test_review_prompt_has_no_append_and_no_board_text(project_v7):
     assert "awaiting-operator" not in plain
 
 
+def test_review_prompt_identifies_active_run_and_conditional_handoff(project_v7):
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    plan = Path(tree.finds["1.1"].plan)
+    _write_plan(plan, "built")
+    task.spec_file = str(plan)
+
+    prompt = engine._review_prompt(task)
+
+    assert f"Native review ownership: run id {engine.state.run_id}; ticket ref 1.1." in prompt
+    assert (
+        "Expected review handoff: generic bmad-build-auto may remove an existing Auto Run Result section"
+        in prompt
+    )
+    assert "Inspect the actual diff and attribute only that exact section removal" in prompt
+    assert "Inspect unrelated dirty changes and foreign runs normally" in prompt
+
+    task.spec_file = None
+    assert "Expected review handoff:" not in engine._review_prompt(task)
+
+
 def test_expected_spec_pinned_on_attempt_one(project_v7):
     """The read-back is pinned to the bound plan from the first dev attempt —
     before the plan exists, with no recorded spec — and to the same plan on the

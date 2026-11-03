@@ -1269,9 +1269,28 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         head = f"/{self._dev_skill('review')} ticket {ref}"
         if self._review_thorough(task):
             head += " thorough"
+        ownership = (
+            f"Native review ownership: run id {self.state.run_id}; ticket ref {ref}. "
+            "You are already running as the native REVIEW worker for this exact pair, "
+            "as the coordinator expects."
+        )
+        handoff = ""
+        if self._generic_dev() and task.spec_file:
+            handoff = (
+                " Expected review handoff: generic bmad-build-auto may remove an existing "
+                "Auto Run Result section from this bound plan before review. Inspect the "
+                "actual diff and attribute only that exact section removal to the "
+                "orchestrator; do not attribute any other change to it."
+            )
+        operating_rules = (
+            " The coordinator's clean-tree check applies only before a new Loop launch. "
+            "Do not start or stop another Loop. Inspect unrelated dirty changes and foreign "
+            "runs normally; do not bypass those checks."
+        )
         return (
             f"{head} — do NOT modify, re-open, or rewrite existing deferred-work ledger "
-            f"entries; the orchestrator owns their status and resolution."
+            f"entries; the orchestrator owns their status and resolution. {ownership}"
+            f"{handoff}{operating_rules}"
         ) + (f" {tail}" if tail else "")
 
     def _prepare_review_continuation(self, task: StoryTask) -> bool:
