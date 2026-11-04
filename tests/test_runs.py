@@ -10881,6 +10881,141 @@ def test_review_continuation_refuses_unproven_legacy_owner(
     assert (run_dir / "state.json").read_bytes() == before
 
 
+def _deferred_review_candidate(tmp_path, *, review_cycle=0):
+    from bmad_loop.model import PAUSE_ESCALATION, SessionRecord
+
+    run_dir, spec_path = _reverify_run(tmp_path)
+    spec_path.write_text(
+        "---\nstatus: blocked\nroute: full\nreview: thorough\n---\n\nplan\n",
+        encoding="utf-8",
+    )
+    state = load_state(run_dir)
+    state.source = "tickets"
+    state.paused_stage = PAUSE_ESCALATION
+    state.paused_story_key = _REVERIFY_KEY
+    task = state.tasks[_REVERIFY_KEY]
+    task.review_cycle = review_cycle
+    task.generation = 2 if review_cycle == 0 else 1
+    task.defer_reason = "reverify failed: configured check"
+    task.salvage_refile_pending = False
+    task.accepted_dev_session_index = 0
+    task.spec_file = str(spec_path.resolve())
+    task.sessions[0].task_id = f"{_REVERIFY_KEY}-dev-1-g1"
+    task.sessions[0].result_json = {"status": "built", "spec_file": task.spec_file}
+    task.sessions.append(
+        SessionRecord(
+            task_id=f"{_REVERIFY_KEY}-review-9-g1",
+            role="review",
+            status="over_budget",
+            result_json=None,
+        )
+    )
+    save_state(run_dir, state)
+    return run_dir, spec_path, state, task
+
+
+@pytest.mark.parametrize("review_cycle", [0, 1])
+@pytest.mark.parametrize("review_status", ["timeout", "stalled", "over_budget"])
+def test_review_continuation_admits_budget_deferred_ticket_history(
+    tmp_path, review_cycle, review_status
+):
+    from bmad_loop.model import Phase
+
+    run_dir, spec_path, state, task = _deferred_review_candidate(
+        tmp_path, review_cycle=review_cycle
+    )
+    task.sessions[-1].status = review_status
+    task.reverify_from = "deferred"
+    task.reverify_replayed = "escalated"
+    save_state(run_dir, state)
+    attempt, generation, cycle = task.attempt, task.generation, task.review_cycle
+
+    refusal = runs.review_continuation_refusal(
+        state, task, _REVERIFY_KEY, project_root=spec_path.parents[2]
+    )
+    assert refusal is None
+
+    runs.continue_review(run_dir, _REVERIFY_KEY, project_root=spec_path.parents[2])
+
+    continued = load_state(run_dir).tasks[_REVERIFY_KEY]
+    assert continued.phase == Phase.REVIEW_VERIFY and continued.review_continuation_pending
+    assert (continued.attempt, continued.generation, continued.review_cycle) == (
+        attempt,
+        generation,
+        cycle,
+    )
+    assert continued.defer_reason is None
+    assert continued.reverify_from == continued.reverify_replayed == ""
+    assert continued.accepted_dev_session_index == 0
+    assert continued.review_continuation_source_identity
+
+
+@pytest.mark.parametrize(
+    ("invalid", "expected_reason"),
+    [
+        ("ordinary-defer", None),
+        ("wrong-owner", None),
+        ("wrong-plan", None),
+        ("wrong-root", None),
+        ("wrong-paused-story", None),
+        (
+            "wrong-plan-status",
+            "'s deferred review is not bound to a blocked full thorough plan",
+        ),
+        (
+            "wrong-plan-route",
+            "'s deferred review is not bound to a blocked full thorough plan",
+        ),
+        (
+            "wrong-plan-review",
+            "'s deferred review is not bound to a blocked full thorough plan",
+        ),
+        (
+            "completed-review",
+            "'s latest review is not an incomplete review (completed)",
+        ),
+    ],
+)
+def test_review_continuation_refuses_unowned_deferred_ticket_without_mutation(
+    tmp_path, invalid, expected_reason
+):
+    run_dir, spec_path, state, task = _deferred_review_candidate(tmp_path)
+    if invalid == "ordinary-defer":
+        task.sessions.pop()
+    elif invalid == "wrong-owner":
+        task.accepted_dev_session_index = None
+    elif invalid == "wrong-plan":
+        task.sessions[0].result_json["spec_file"] = str(spec_path.with_name("other.md"))
+    elif invalid == "wrong-paused-story":
+        state.paused_story_key = "other-story"
+    elif invalid.startswith("wrong-plan-"):
+        field, value = {
+            "wrong-plan-status": ("status", "in-review"),
+            "wrong-plan-route": ("route", "standard"),
+            "wrong-plan-review": ("review", "standard"),
+        }[invalid]
+        plan = spec_path.read_text(encoding="utf-8")
+        old_value = {"status": "blocked", "route": "full", "review": "thorough"}[field]
+        spec_path.write_text(
+            plan.replace(f"{field}: {old_value}", f"{field}: {value}"),
+            encoding="utf-8",
+        )
+    elif invalid == "completed-review":
+        task.sessions[-1].status = "completed"
+    else:
+        state.repo_root = str(spec_path.parents[2] / "other-root")
+    save_state(run_dir, state)
+    before = (run_dir / "state.json").read_bytes()
+
+    refusal = pytest.raises(runs.RearmError)
+    with refusal as exc:
+        runs.continue_review(run_dir, _REVERIFY_KEY, project_root=spec_path.parents[2])
+    if expected_reason is not None:
+        assert str(exc.value) == f"story {_REVERIFY_KEY}{expected_reason}"
+
+    assert (run_dir / "state.json").read_bytes() == before
+
+
 def test_rearm_for_reverify_accepts_a_verify_env_fault_escalation(tmp_path):
     from bmad_loop.model import Phase
 

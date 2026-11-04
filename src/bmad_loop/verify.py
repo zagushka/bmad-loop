@@ -9395,8 +9395,9 @@ def verify_dev_tickets(
       skips proof-of-work as :func:`verify_dev_stories` does. ``awaiting-operator``
       when ``operator_park`` is on and the plan declares it, held to the same
       actions gate and park-assertion waiver as :func:`verify_dev`.
-      ``blocked`` and cycle-one ``built`` results are accepted only on the explicit
-      review-continuation leg with a compatible bound plan. The baseline and
+      ``blocked`` first-review results and accepted ``built`` retained-review results
+      are accepted only on the explicit review-continuation leg with a compatible
+      bound plan. The baseline and
       proof-of-work gates still run.
     - A ``dropped`` plan escalates as a contradiction: a human withdrew the ticket
       while its session ran, and no retry can build a dropped ticket.
@@ -9457,7 +9458,22 @@ def verify_dev_tickets(
             "blocked": {"blocked", "in-review"},
             "built": {"built", "blocked", "in-review"},
         }
-        if task.review_cycle == 0:
+        owner_index = task.accepted_dev_session_index
+        retained_review = False
+        if type(owner_index) is int and 0 <= owner_index < len(task.sessions):
+            # Official reverify resets review_cycle but keeps the primary history.
+            owner = task.sessions[owner_index]
+            retained_review = (
+                not owner.label
+                and owner.role == "dev"
+                and owner.status == "completed"
+                and owner.result_json is not None
+                and any(
+                    not session.label and session.role == "review"
+                    for session in task.sessions[owner_index + 1 :]
+                )
+            )
+        if task.review_cycle == 0 and not retained_review:
             allowed_plan_statuses = {"blocked": {"blocked", "in-review"}}
         if status not in allowed_plan_statuses.get(result_status, set()):
             return VerifyOutcome.retry(

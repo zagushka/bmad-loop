@@ -206,6 +206,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Continue an explicitly selected blocked full/thorough ticket review after budget or timeout deferral, including after a failed reverify resets the review counter; keep source, ownership and verification gates.
+
 - Refuse model dispatch when a worktree no longer matches its recorded identity.
 
 - Reject symlinked or non-local Codex hook configurations before checking trust.

@@ -6471,7 +6471,20 @@ def review_continuation_refusal(
     hint = f"re-arm it with `bmad-loop resolve {state.run_id}` instead"
     if state.run_type == "sweep":
         return f"--continue-review is not supported for sweep runs ({story_key}); {hint}"
-    if state.finished or state.paused_stage != PAUSE_ESCALATION or task.phase != Phase.ESCALATED:
+    deferred_ticket_review = task.phase == Phase.DEFERRED
+    if (
+        state.finished
+        or task.phase not in {Phase.ESCALATED, Phase.DEFERRED}
+        or (task.phase == Phase.ESCALATED and state.paused_stage != PAUSE_ESCALATION)
+        or (
+            deferred_ticket_review
+            and (
+                state.source != worksource.SOURCE_TICKETS
+                or state.paused_stage != PAUSE_ESCALATION
+                or state.paused_story_key != story_key
+            )
+        )
+    ):
         return (
             f"story {story_key} is not an escalation-paused task eligible for review continuation"
         )
@@ -6496,7 +6509,35 @@ def review_continuation_refusal(
     dev_index, dev = dev_records[-1]
     if dev.status != "completed" or dev.result_json is None:
         return f"story {story_key} has no completed implementation candidate"
-    if task.review_cycle == 0:
+    if deferred_ticket_review:
+        if primary[-1][1].role != "review":
+            return f"story {story_key}'s latest primary session is not a review"
+        review = primary[-1][1]
+        if review.status not in REVIEW_TIMEOUT_STATUSES:
+            return (
+                f"story {story_key}'s latest review is not an incomplete review ({review.status})"
+            )
+        if task.accepted_dev_session_index != dev_index:
+            return f"story {story_key} has no accepted implementation candidate"
+        plan_path = Path(task.spec_file).resolve()
+        if (
+            not dev.result_json.get("spec_file")
+            or Path(str(dev.result_json["spec_file"])).resolve() != plan_path
+        ):
+            return f"story {story_key}'s dev result does not bind its recorded plan"
+        try:
+            fields = parse_frontmatter(plan_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            return f"cannot read story {story_key}'s blocked review plan ({e})"
+        if (
+            fields.get("status") != "blocked"
+            or fields.get("route") != "full"
+            or fields.get("review") != "thorough"
+        ):
+            return (
+                f"story {story_key}'s deferred review is not bound to a blocked full thorough plan"
+            )
+    elif task.review_cycle == 0:
         if (
             state.source != worksource.SOURCE_TICKETS
             or primary[-1][1].role != "dev"
@@ -6708,6 +6749,7 @@ def continue_review(
         task = state.tasks.get(story_key)
         if task is None:
             raise RearmError(f"run {state.run_id} has no task for story {story_key}")
+        deferred_ticket_review = task.phase == Phase.DEFERRED
         if (
             refusal := review_continuation_refusal(
                 state,
@@ -6734,6 +6776,11 @@ def continue_review(
             ) from e
         task.phase = Phase.REVIEW_VERIFY
         task.review_continuation_pending = True
+        if deferred_ticket_review:
+            # A deferred candidate's old latch must not re-enter the defer arm.
+            task.defer_reason = None
+            task.reverify_from = ""
+            task.reverify_replayed = ""
         state.clear_pause()
         Journal(run_dir, pin=state).append("review-continuation-armed", story_key=story_key)
         save_state(run_dir, state)

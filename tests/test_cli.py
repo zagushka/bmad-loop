@@ -24295,6 +24295,115 @@ def test_resolve_continue_review_admits_blocked_ticket_before_first_review(
     assert continued.phase == Phase.REVIEW_VERIFY and continued.review_continuation_pending
 
 
+def test_resolve_continue_review_admits_named_deferred_ticket_on_escalation_pause(
+    tmp_path, monkeypatch, capsys
+):
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import PAUSE_ESCALATION, Phase, SessionRecord
+
+    run_dir, project = _reverify_project(tmp_path)
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    task.phase = Phase.DEFERRED
+    task.review_cycle = 0
+    task.generation = 2
+    task.defer_reason = "reverify failed: configured check"
+    task.salvage_refile_pending = False
+    task.accepted_dev_session_index = 0
+    task.spec_file = str((project / task.spec_file).resolve())
+    task.sessions[0].result_json = {"status": "built", "spec_file": task.spec_file}
+    task.sessions.append(
+        SessionRecord(
+            task_id=f"{_REVERIFY_KEY}-review-9-g1",
+            role="review",
+            status="over_budget",
+            result_json=None,
+        )
+    )
+    Path(task.spec_file).write_text(
+        "---\nstatus: blocked\nroute: full\nreview: thorough\n---\n\nplan\n",
+        encoding="utf-8",
+    )
+    state.source = "tickets"
+    state.paused_stage = PAUSE_ESCALATION
+    state.paused_story_key = _REVERIFY_KEY
+    save_state(run_dir, state)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *args: resumed.append(args[-1]) or 0)
+    monkeypatch.setattr(
+        "bmad_loop.resolve.run_session", lambda *a, **k: pytest.fail("ran resolve agent")
+    )
+
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(project),
+            "r1",
+            "--continue-review",
+            "--story",
+            _REVERIFY_KEY,
+            "--resume",
+        ]
+    )
+
+    assert rc == 0 and resumed == [run_dir]
+    continued = load_state(run_dir).tasks[_REVERIFY_KEY]
+    assert continued.phase == Phase.REVIEW_VERIFY and continued.review_continuation_pending
+    assert continued.attempt == 2 and continued.generation == 2 and continued.review_cycle == 0
+    assert continued.defer_reason is None
+    assert continued.accepted_dev_session_index == 0
+
+
+def test_resolve_continue_review_requires_named_deferred_candidate(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import PAUSE_ESCALATION, Phase, SessionRecord
+
+    run_dir, project = _reverify_project(tmp_path)
+    state = load_state(run_dir)
+    task = state.tasks[_REVERIFY_KEY]
+    task.phase = Phase.DEFERRED
+    task.review_cycle = 0
+    task.generation = 2
+    task.defer_reason = "reverify failed: configured check"
+    task.salvage_refile_pending = False
+    task.accepted_dev_session_index = 0
+    task.spec_file = str((project / task.spec_file).resolve())
+    task.sessions[0].result_json = {
+        "workflow": "auto-dev",
+        "status": "built",
+        "spec_file": task.spec_file,
+    }
+    task.sessions.append(
+        SessionRecord(
+            task_id=f"{_REVERIFY_KEY}-review-9-g1",
+            role="review",
+            status="over_budget",
+            result_json=None,
+        )
+    )
+    Path(task.spec_file).write_text(
+        "---\nstatus: blocked\nroute: full\nreview: thorough\n---\n\nplan\n",
+        encoding="utf-8",
+    )
+    state.source = "tickets"
+    state.paused_stage = PAUSE_ESCALATION
+    state.paused_story_key = _REVERIFY_KEY
+    save_state(run_dir, state)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda *_: pytest.fail("prompted on refusal"))
+    monkeypatch.setattr(cli, "_reject_store_topology", lambda *args, **kwargs: None)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *args: resumed.append(args[-1]) or 0)
+
+    rc = cli.main(["resolve", "--project", str(project), "r1", "--continue-review", "--resume"])
+
+    assert rc == 1
+    assert "deferred, not escalated" in capsys.readouterr().err
+    assert resumed == []
+    assert _state_bytes(run_dir) == before
+
+
 def test_resolve_continue_review_refuses_non_incomplete_review_without_mutation(
     tmp_path, monkeypatch, capsys
 ):

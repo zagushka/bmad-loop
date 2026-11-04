@@ -6296,6 +6296,8 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # whether the named story qualifies. Everything else needs the escalation pause,
     # or no pause with the story still escalated (`runs.escalation_resolvable`, #958).
     reverify_named = bool(getattr(args, "reverify", False) and args.story)
+    continue_review = bool(getattr(args, "continue_review", False))
+    continue_review_named = continue_review and bool(args.story)
     if not _resolve_pause_admits(state, reverify_named=reverify_named):
         print(
             runs.not_escalation_pause_message(args.run_id, state.paused_stage),
@@ -6305,7 +6307,21 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     story_key = args.story or runs.default_escalation_key(state)
     task = state.tasks.get(story_key) if story_key else None
     reverify = getattr(args, "reverify", False)
-    if story_key is not None and task is not None and task.phase == Phase.DEFERRED and not reverify:
+    deferred_review_continuation = bool(
+        continue_review_named and task is not None and task.phase == Phase.DEFERRED
+    )
+    allowed_phases = (
+        (Phase.ESCALATED, Phase.DEFERRED)
+        if reverify or deferred_review_continuation
+        else (Phase.ESCALATED,)
+    )
+    if (
+        story_key is not None
+        and task is not None
+        and task.phase == Phase.DEFERRED
+        and not reverify
+        and not deferred_review_continuation
+    ):
         # DW-522: a deferred story has nothing to resolve, but its kept work may be
         # re-verifiable — point at the flag instead of a bare refusal.
         print(
@@ -6319,8 +6335,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if (
         story_key is None
         or task is None
-        or task.phase not in ((Phase.ESCALATED, Phase.DEFERRED) if reverify else (Phase.ESCALATED,))
-        or (not reverify_named and not runs.escalation_story_admitted(state, story_key))
+        or task.phase not in allowed_phases
+        or (
+            not reverify_named
+            and not deferred_review_continuation
+            and not runs.escalation_story_admitted(state, story_key)
+        )
     ):
         print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
         return 1
@@ -6386,7 +6406,6 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # The resume's ticket-store refusal, judged ahead of the reverify/adopt
     # dispatches for the same reason: each persists its transition before the
     # resume that would refuse a changed store. The re-arm path judges it below.
-    continue_review = getattr(args, "continue_review", False)
     early = reverify or getattr(args, "adopt_branch", False) or continue_review
     if (
         early
@@ -9881,8 +9900,9 @@ def main(argv: list[str] | None = None) -> int:
     resolve_mode.add_argument(
         "--continue-review",
         action="store_true",
-        help="continue review on the operator-selected retained in-place candidate without a dev session; "
-        "preserves attempt and usage counters, and refuses unsupported or changed candidates",
+        help="continue review on an explicitly selected retained in-place candidate, including a blocked "
+        "full/thorough ticket after budget or timeout deferral; preserves attempt and usage counters and "
+        "runs no dev session",
     )
     resolve_mode.add_argument(
         "--abandon",

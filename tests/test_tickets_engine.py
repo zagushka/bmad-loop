@@ -1923,6 +1923,164 @@ def test_cycle_one_blocked_review_continuation_is_review_only_and_gated(
     assert finished.accepted_dev_session_index == 0
 
 
+def test_budget_deferred_review_continuation_after_reverify_keeps_gates_and_owner(
+    project_v7, monkeypatch
+):
+    from bmad_loop.model import PAUSE_ESCALATION, Phase, SessionRecord
+
+    blocked_at = "2026-11-03T10:00:00Z"
+    blocked_reason = "nested thorough review incomplete"
+    tree = _tree(
+        project_v7,
+        blocked=(
+            ticket_row(
+                "1.1", status="blocked", blocked_at=blocked_at, blocked_reason=blocked_reason
+            ),
+        ),
+    )
+    policy = Policy(
+        gates=GatesPolicy(mode="per-story-spec-approval"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="recommended"),
+        verify=VerifyPolicy(commands=("git diff --check",)),
+    )
+    engine, _ = make_engine(project_v7, tree, policy=policy, source="tickets")
+    task = _bound(engine, tree)
+    baseline = verify.rev_parse_head(project_v7.project)
+    plan = write_plan(
+        project_v7,
+        "epic-cart",
+        "story-cart-model-plan",
+        1,
+        "blocked",
+        blocked_reason=blocked_reason,
+        blocked_at=blocked_at,
+        route="full",
+        review="thorough",
+        baseline_revision=baseline,
+    )
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    task.ticket = ticket_binding(tree.finds["1.1"])
+    (project_v7.project / "src.txt").write_text("retained candidate\n", encoding="utf-8")
+    git(project_v7.project, "add", "src.txt")
+    git(project_v7.project, "commit", "-q", "-m", "retained ticket candidate")
+
+    task.phase = Phase.DEFERRED
+    task.attempt = 1
+    task.review_cycle = 0
+    task.generation = 2  # official failed reverify retained review history from generation 1
+    task.baseline_commit = baseline
+    task.spec_file = str(plan.resolve())
+    task.defer_reason = "reverify failed: configured check"
+    task.salvage_refile_pending = False
+    task.accepted_dev_session_index = 0
+    task.sessions.extend(
+        [
+            SessionRecord(
+                task_id="1.1-dev-1-g1",
+                role="dev",
+                status="completed",
+                result_json={
+                    "workflow": "auto-dev",
+                    "status": "built",
+                    "spec_file": str(plan.resolve()),
+                },
+            ),
+            SessionRecord(
+                task_id="1.1-review-9-g1",
+                role="review",
+                status="over_budget",
+                result_json=None,
+            ),
+        ]
+    )
+    engine.state.paused_stage = PAUSE_ESCALATION
+    engine.state.paused_story_key = task.story_key
+    save_state(engine.run_dir, engine.state)
+    runs.continue_review(engine.run_dir, task.story_key, project_root=project_v7.project)
+
+    native_tree = TicketTree(project_v7.project, pinned_initiative=project_v7.initiative)
+    real_mark = native_tree.mark
+
+    def mark(ref, target, **kw):
+        result = real_mark(ref, target, **kw)
+        if result.outcome == "written":
+            tree.finds["1.1"] = dataclasses.replace(
+                tree.finds["1.1"], row=ticket_row("1.1", status=target)
+            )
+        return result
+
+    monkeypatch.setattr(tree, "mark", mark)
+
+    def review(spec: SessionSpec) -> SessionResult:
+        current = Path(spec.cwd) / plan.relative_to(project_v7.project)
+        assert status_of(parse_frontmatter(current.read_text(encoding="utf-8"))) == "in-review"
+        current.write_text(
+            current.read_text(encoding="utf-8").replace("status: in-review", "status: built"),
+            encoding="utf-8",
+        )
+        tree.finds["1.1"] = dataclasses.replace(
+            tree.finds["1.1"], row=ticket_row("1.1", status="built")
+        )
+        return SessionResult(
+            status="completed",
+            result_json={"workflow": "auto-dev", "status": "built", "spec_file": str(current)},
+        )
+
+    before = load_state(engine.run_dir).tasks["1.1"]
+    first_adapter = MockAdapter([])
+    first = TicketsEngine(
+        paths=engine.paths,
+        policy=policy,
+        adapter=first_adapter,
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=load_state(engine.run_dir),
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+    approval_pause = first.run()
+    assert approval_pause.paused and "spec approval" in approval_pause.paused_reason
+    paused = load_state(engine.run_dir)
+    paused_task = paused.tasks["1.1"]
+    assert paused.paused_stage == "spec-approval"
+    assert paused_task.phase == Phase.DEV_VERIFY and paused_task.review_continuation_pending
+    assert paused_task.accepted_dev_session_index == 0
+    assert (paused_task.attempt, paused_task.generation, paused_task.review_cycle) == (
+        before.attempt,
+        before.generation,
+        before.review_cycle,
+    )
+    verify_rows = [
+        row for row in _kinds(first, "verify-command-result") if row["verification_stage"] == "dev"
+    ]
+    assert len(verify_rows) == 1 and verify_rows[0]["returncode"] == 0
+    assert first_adapter.sessions == []
+
+    paused.clear_pause()
+    save_state(engine.run_dir, paused)
+    resumed_adapter = MockAdapter([review])
+    resumed = TicketsEngine(
+        paths=engine.paths,
+        policy=policy,
+        adapter=resumed_adapter,
+        run_dir=engine.run_dir,
+        journal=Journal(engine.run_dir),
+        state=load_state(engine.run_dir),
+        ticket_tree_factory=lambda root, pin: tree,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert [session.role for session in resumed_adapter.sessions] == ["review"]
+    finished = load_state(engine.run_dir).tasks["1.1"]
+    assert finished.phase == Phase.DONE and finished.accepted_dev_session_index == 0
+    assert (finished.attempt, finished.generation, finished.review_cycle) == (
+        before.attempt,
+        before.generation,
+        before.review_cycle + 1,
+    )
+
+
 def test_reverify_blocked_review_legacy_owner_recovers_through_normal_gates(
     project_v7, tmp_path, monkeypatch
 ):
